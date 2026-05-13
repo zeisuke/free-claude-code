@@ -165,6 +165,29 @@ class Settings(BaseSettings):
     model_sonnet: str | None = Field(default=None, validation_alias="MODEL_SONNET")
     model_haiku: str | None = Field(default=None, validation_alias="MODEL_HAIKU")
 
+    # Comma-separated provider/model-id strings to exclude from /v1/models discovery.
+    # e.g. MODEL_BLOCKLIST=open_router/nvidia/nemotron-3-super-120b-a12b:free,nvidia_nim/nvidia/nemotron-3-super-120b-a12b
+    model_blocklist_raw: str = Field(default="", validation_alias="MODEL_BLOCKLIST")
+
+    @property
+    def model_blocklist(self) -> frozenset[str]:
+        return frozenset(m.strip() for m in self.model_blocklist_raw.split(",") if m.strip())
+
+    # Comma-separated provider/model-ref strings for the circuit-breaker pool.
+    # Format: "open_router/minimax/minimax-m2.5:free,open_router/google/gemma-4-31b-it:free"
+    # When empty, pool-based fallback is disabled (single configured MODEL only).
+    model_pool_raw: str = Field(default="", validation_alias="MODEL_POOL")
+
+    # How long (seconds) to wait for the first SSE token before penalising a pool model.
+    model_pool_first_token_timeout: float = Field(
+        default=8.0, validation_alias="MODEL_POOL_FIRST_TOKEN_TIMEOUT"
+    )
+
+    @property
+    def model_pool(self) -> list[str]:
+        """Parsed model pool list. Empty list means pool fallback disabled."""
+        return [m.strip() for m in self.model_pool_raw.split(",") if m.strip()]
+
     # ==================== Per-Provider Proxy ====================
     nvidia_nim_proxy: str = Field(default="", validation_alias="NVIDIA_NIM_PROXY")
     open_router_proxy: str = Field(default="", validation_alias="OPENROUTER_PROXY")

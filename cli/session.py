@@ -147,6 +147,7 @@ class CLISession:
                     "stream-json",
                     "--dangerously-skip-permissions",
                     "--verbose",
+                    "--max-turns", "35",
                 ]
 
             if self.allowed_dirs:

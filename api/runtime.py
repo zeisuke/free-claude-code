@@ -13,6 +13,7 @@ from loguru import logger
 
 from api.admin_urls import local_admin_url, local_proxy_root_url
 from config.settings import Settings, get_settings
+from providers.circuit_breaker import DEFAULT_POOL, ModelPool, make_pool
 from providers.exceptions import ServiceUnavailableError
 from providers.registry import ProviderRegistry
 
@@ -88,6 +89,7 @@ class AppRuntime:
     app: FastAPI
     settings: Settings
     _provider_registry: ProviderRegistry | None = field(default=None, init=False)
+    _pool: ModelPool | None = field(default=None, init=False)
     messaging_platform: MessagingPlatform | None = None
     message_handler: ClaudeMessageHandler | None = None
     cli_manager: CLISessionManager | None = None
@@ -109,6 +111,13 @@ class AppRuntime:
         try:
             warn_if_process_auth_token(self.settings)
             await self._validate_configured_models_best_effort()
+            pool_models = getattr(self.settings, "model_pool", None) or []
+            if pool_models:
+                self._pool = make_pool(pool_models)
+                self.app.state.pool = self._pool
+                logger.info(
+                    "Circuit-breaker pool initialized: {} models", len(pool_models)
+                )
             self._provider_registry.start_model_list_refresh(self.settings)
             await self._start_messaging_if_configured()
             self._publish_state()

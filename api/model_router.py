@@ -47,25 +47,35 @@ class ModelRouter:
             force_thinking_enabled,
         ) = self._direct_provider_model(claude_model_name)
         if direct_provider_id is not None and direct_provider_model is not None:
-            thinking_enabled = (
-                force_thinking_enabled
-                if force_thinking_enabled is not None
-                else self._settings.resolve_thinking(direct_provider_model)
-            )
-            logger.debug(
-                "MODEL DIRECT: '{}' -> provider='{}' model='{}' thinking={}",
-                claude_model_name,
-                direct_provider_id,
-                direct_provider_model,
-                thinking_enabled,
-            )
-            return ResolvedModel(
-                original_model=claude_model_name,
-                provider_id=direct_provider_id,
-                provider_model=direct_provider_model,
-                provider_model_ref=claude_model_name,
-                thinking_enabled=thinking_enabled,
-            )
+            # Redirect blocked models to the configured fallback instead of hanging
+            provider_model_ref_candidate = f"{direct_provider_id}/{direct_provider_model}"
+            if provider_model_ref_candidate in self._settings.model_blocklist:
+                logger.warning(
+                    "MODEL BLOCKED: '{}' is blocklisted — falling back to configured model",
+                    provider_model_ref_candidate,
+                )
+                direct_provider_id = None
+                direct_provider_model = None
+            else:
+                thinking_enabled = (
+                    force_thinking_enabled
+                    if force_thinking_enabled is not None
+                    else self._settings.resolve_thinking(direct_provider_model)
+                )
+                logger.debug(
+                    "MODEL DIRECT: '{}' -> provider='{}' model='{}' thinking={}",
+                    claude_model_name,
+                    direct_provider_id,
+                    direct_provider_model,
+                    thinking_enabled,
+                )
+                return ResolvedModel(
+                    original_model=claude_model_name,
+                    provider_id=direct_provider_id,
+                    provider_model=direct_provider_model,
+                    provider_model_ref=claude_model_name,
+                    thinking_enabled=thinking_enabled,
+                )
 
         provider_model_ref = self._settings.resolve_model(claude_model_name)
         thinking_enabled = self._settings.resolve_thinking(claude_model_name)

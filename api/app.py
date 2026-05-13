@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 from starlette.types import Receive, Scope, Send
@@ -107,6 +108,13 @@ def create_app(*, lifespan_enabled: bool = True) -> FastAPI:
         ):
             response = await call_next(request)
         return response
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+        allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
     # Register routes
     app.include_router(admin_router)

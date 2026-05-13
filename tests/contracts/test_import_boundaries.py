@@ -10,7 +10,9 @@ _API_ALLOWED_PROVIDER_MODULES = frozenset(
     {
         "providers",
         "providers.base",
+        "providers.circuit_breaker",
         "providers.exceptions",
+        "providers.pool_stream",
         "providers.registry",
     }
 )

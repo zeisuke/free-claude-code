@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import traceback
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -12,11 +14,15 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 
 from config.settings import Settings
+from core import circuit_breaker as _cb
 from core.anthropic import get_token_count, get_user_facing_error_message
 from core.anthropic.sse import ANTHROPIC_SSE_RESPONSE_HEADERS
 from core.trace import api_messages_request_snapshot, trace_event, traced_async_stream
 from providers.base import BaseProvider
+from providers.circuit_breaker import ModelPool
 from providers.exceptions import InvalidRequestError, ProviderError
+from providers.pool_stream import stream_with_pool
+from providers.registry import ProviderRegistry
 
 from .model_router import ModelRouter
 from .models.anthropic import MessagesRequest, TokenCountRequest
@@ -84,6 +90,101 @@ def _require_non_empty_messages(messages: list[Any]) -> None:
         raise InvalidRequestError("messages cannot be empty")
 
 
+_ALL_FAILED_SSE = (
+    'event: error\ndata: {"type":"error","error":{"type":"overloaded_error",'
+    '"message":"All pool models unavailable — retry later."}}\n\n'
+)
+
+
+async def _pool_stream(
+    pool: list[str],
+    base_request: MessagesRequest,
+    input_tokens: int,
+    request_id: str,
+    provider_getter: ProviderGetter,
+    settings: Settings,
+) -> AsyncIterator[str]:
+    """Try each hot pool model in order; fall back on hang or error SSE.
+
+    A model is penalised (5 min cooldown) when:
+    - No first SSE token within ``model_pool_first_token_timeout`` seconds, OR
+    - The first token is an error-type SSE event (model returned an error).
+
+    A 429 error SSE triggers a 15-min cooldown.
+    """
+    timeout = settings.model_pool_first_token_timeout
+    ordered = _cb.pick_models(pool)
+    last_err_chunk: str | None = None
+
+    for model_ref in ordered:
+        provider_id = Settings.parse_provider_type(model_ref)
+        provider_model = Settings.parse_model_name(model_ref)
+        try:
+            provider = provider_getter(provider_id)
+        except Exception:
+            continue
+
+        routed = base_request.model_copy(update={"model": provider_model}, deep=True)
+        thinking = settings.resolve_thinking(base_request.model)
+        gen = provider.stream_response(
+            routed,
+            input_tokens=input_tokens,
+            request_id=request_id,
+            thinking_enabled=thinking,
+        )
+
+        # --- probe: first token with timeout ---
+        try:
+            first = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            _cb.mark_used(model_ref)
+            return
+        except asyncio.TimeoutError:
+            logger.warning("CB: {} first-token timeout ({}s) → penalising", model_ref, timeout)
+            _cb.penalise(model_ref, is_429=False)
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+            continue
+        except Exception as exc:
+            logger.warning("CB: {} error before first token: {} → penalising", model_ref, exc)
+            _cb.penalise(model_ref, is_429=False)
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+            continue
+
+        # --- inspect first token for error SSE ---
+        is_error = "event: error" in first or (
+            '"type":"error"' in first and '"type":"message"' not in first
+        )
+        if is_error:
+            is_429 = "rate_limit" in first
+            logger.warning("CB: {} returned error SSE (429={}) → penalising", model_ref, is_429)
+            _cb.penalise(model_ref, is_429=is_429)
+            last_err_chunk = first
+            # drain and discard remaining error events
+            try:
+                async for _ in gen:
+                    pass
+            except Exception:
+                pass
+            continue
+
+        # --- success: stream the rest ---
+        _cb.mark_used(model_ref)
+        logger.info("CB: {} selected for request_id={}", model_ref, request_id)
+        yield first
+        async for chunk in gen:
+            yield chunk
+        return
+
+    # all models failed — emit the last error or a generic one
+    yield last_err_chunk or _ALL_FAILED_SSE
+
+
 class ClaudeProxyService:
     """Coordinate request optimization, model routing, token count, and providers."""
 
@@ -93,11 +194,15 @@ class ClaudeProxyService:
         provider_getter: ProviderGetter,
         model_router: ModelRouter | None = None,
         token_counter: TokenCounter = get_token_count,
+        pool: ModelPool | None = None,
+        provider_registry: ProviderRegistry | None = None,
     ):
         self._settings = settings
         self._provider_getter = provider_getter
         self._model_router = model_router or ModelRouter(settings)
         self._token_counter = token_counter
+        self._pool = pool
+        self._provider_registry = provider_registry
 
     def create_message(self, request_data: MessagesRequest) -> object:
         """Create a message response or streaming response."""
@@ -176,36 +281,41 @@ class ClaudeProxyService:
                     snapshot=api_messages_request_snapshot(routed.request),
                 )
 
-                if self._settings.log_raw_api_payloads:
-                    logger.debug(
-                        "FULL_PAYLOAD [{}]: {}", request_id, routed.request.model_dump()
-                    )
+            input_tokens = self._token_counter(
+                routed.request.messages, routed.request.system, routed.request.tools
+            )
 
-                input_tokens = self._token_counter(
-                    routed.request.messages,
-                    routed.request.system,
-                    routed.request.tools,
+            if (
+                self._pool is not None
+                and self._provider_registry is not None
+                and routed.resolved.provider_id == "open_router"
+            ):
+                stream = stream_with_pool(
+                    routed.request,
+                    self._pool,
+                    self._provider_registry,
+                    self._settings,
+                    request_id=request_id,
                 )
-
-                streamed = traced_async_stream(
-                    provider.stream_response(
+            else:
+                settings_pool = self._settings.model_pool
+                if settings_pool and routed.resolved.provider_id not in _OPENAI_CHAT_UPSTREAM_IDS:
+                    stream = _pool_stream(
+                        settings_pool,
+                        routed.request,
+                        input_tokens,
+                        request_id,
+                        self._provider_getter,
+                        self._settings,
+                    )
+                else:
+                    stream = provider.stream_response(
                         routed.request,
                         input_tokens=input_tokens,
                         request_id=request_id,
                         thinking_enabled=routed.resolved.thinking_enabled,
-                    ),
-                    stage="egress",
-                    source="api",
-                    complete_event="api.response.stream_completed",
-                    interrupted_event="api.response.stream_interrupted",
-                    chunk_event=None,
-                    extra={
-                        "request_id": request_id,
-                        "provider_id": routed.resolved.provider_id,
-                        "gateway_model": routed.request.model,
-                    },
-                )
-                return anthropic_sse_streaming_response(streamed)
+                    )
+            return anthropic_sse_streaming_response(stream)
 
         except ProviderError:
             raise
