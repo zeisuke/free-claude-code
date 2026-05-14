@@ -10,6 +10,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import httpx
+
 # Opt-in to future behavior for python-telegram-bot (retry_after as timedelta)
 # This must be set BEFORE importing telegram.error
 os.environ["PTB_TIMEDELTA"] = "1"
@@ -471,6 +473,36 @@ class TelegramPlatform(MessagingPlatform):
         else:
             _ = asyncio.ensure_future(task)
 
+    async def _dispatch_to_execute(self, incoming: IncomingMessage) -> None:
+        """Send status msg then fire-and-forget POST /execute. search_api replies directly."""
+        status_msg_id = await self.queue_send_message(
+            incoming.chat_id,
+            "🔄 Processing\\.\\.\\.".replace("\\.", "\\."),
+            reply_to=incoming.message_id,
+            parse_mode="MarkdownV2",
+            fire_and_forget=False,
+            message_thread_id=incoming.message_thread_id,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as _http:
+                await _http.post(
+                    "http://localhost:8765/execute",
+                    json={
+                        "task": incoming.text,
+                        "from": f"{incoming.platform}:{incoming.user_id}",
+                        "reply_chat_id": incoming.chat_id,
+                        "status_message_id": str(status_msg_id) if status_msg_id else None,
+                    },
+                )
+        except Exception as e:
+            logger.warning("dispatch_to_execute failed chat={}: {}", incoming.chat_id, e)
+            if status_msg_id:
+                await self.queue_edit_message(
+                    incoming.chat_id, str(status_msg_id),
+                    "❌ Service unavailable\\.",
+                    parse_mode="MarkdownV2",
+                )
+
     def on_message(
         self,
         handler: Callable[[IncomingMessage], Awaitable[None]],
@@ -544,9 +576,6 @@ class TelegramPlatform(MessagingPlatform):
                 len(raw_text),
             )
 
-        if not self._message_handler:
-            return
-
         incoming = IncomingMessage(
             text=update.message.text,
             chat_id=chat_id,
@@ -559,12 +588,12 @@ class TelegramPlatform(MessagingPlatform):
         )
 
         try:
-            await self._message_handler(incoming)
+            await self._dispatch_to_execute(incoming)
         except Exception as e:
             if self._log_api_error_tracebacks:
-                logger.error("Error handling message: {}", e)
+                logger.error("Error dispatching message: {}", e)
             else:
-                logger.error("Error handling message: exc_type={}", type(e).__name__)
+                logger.error("Error dispatching message: exc_type={}", type(e).__name__)
             with contextlib.suppress(Exception):
                 await self.send_message(
                     chat_id,
@@ -595,9 +624,6 @@ class TelegramPlatform(MessagingPlatform):
 
         if self.allowed_user_id and user_id != str(self.allowed_user_id).strip():
             logger.warning(f"Unauthorized voice access attempt from {user_id}")
-            return
-
-        if not self._message_handler:
             return
 
         thread_id = (
@@ -680,7 +706,7 @@ class TelegramPlatform(MessagingPlatform):
                     len(transcribed),
                 )
 
-            await self._message_handler(incoming)
+            await self._dispatch_to_execute(incoming)
         except ValueError as e:
             await update.message.reply_text(format_user_error_preview(e))
         except ImportError as e:

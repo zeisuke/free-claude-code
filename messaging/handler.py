@@ -8,9 +8,17 @@ Uses tree-based queuing for message ordering.
 
 import asyncio
 
+import httpx
 from loguru import logger
 
-from core.anthropic import format_user_error_preview, get_user_facing_error_message
+from core.kb_client import (
+    build_context_prefix,
+    dedupe,
+    fetch_recent,
+    room_id_for,
+    search_room,
+    store,
+)
 from core.trace import trace_event
 
 from .cli_event_constants import STATUS_MESSAGE_PREFIXES
@@ -19,21 +27,18 @@ from .command_dispatcher import (
     message_kind_for_command,
     parse_command_base,
 )
-from .event_parser import parse_cli_event
 from .models import IncomingMessage
-from .node_event_pipeline import handle_session_info_event, process_parsed_cli_event
 from .platforms.base import MessagingPlatform, SessionManagerInterface
 from .rendering.profiles import build_rendering_profile
 from .safe_diagnostics import format_exception_for_log
 from .session import SessionStore
-from .transcript import RenderCtx, TranscriptBuffer
+from .transcript import RenderCtx
 from .trees.queue_manager import (
     MessageNode,
     MessageState,
     MessageTree,
     TreeQueueManager,
 )
-from .ui_updates import ThrottledTranscriptEditor
 
 
 class ClaudeMessageHandler:
@@ -298,16 +303,6 @@ class ClaudeMessageHandler:
             )
         )
 
-    def _create_transcript_and_render_ctx(
-        self,
-    ) -> tuple[TranscriptBuffer, RenderCtx]:
-        """Create transcript buffer and render context for node processing."""
-        transcript = TranscriptBuffer(
-            show_tool_results=False,
-            debug_subagent_stack=self._debug_subagent_stack,
-        )
-        return transcript, self.get_render_ctx()
-
     async def _process_node(
         self,
         node_id: str,
@@ -330,231 +325,87 @@ class ClaudeMessageHandler:
     ) -> None:
         """Internal implementation of _process_node with context bound."""
         incoming = node.incoming
+        platform_nm = getattr(self.platform, "name", "messaging")
 
         tree = self.tree_queue.get_tree_for_node(node_id)
         if tree:
             await tree.update_state(node_id, MessageState.IN_PROGRESS)
 
-        transcript, render_ctx = self._create_transcript_and_render_ctx()
+        _kb_room = room_id_for(incoming.platform, incoming.user_id)
 
-        had_transcript_events = False
-        captured_session_id = None
-        temp_session_id = None
-        last_status: str | None = None
-
-        parent_session_id = None
-        platform_nm = getattr(self.platform, "name", "messaging")
-        if tree and node.parent_id:
-            parent_session_id = tree.get_parent_session_id(node_id)
-            if parent_session_id:
-                trace_event(
-                    stage="claude_cli",
-                    event="claude_cli.fork.from_parent_session",
-                    source=platform_nm,
-                    chat_id=chat_id,
-                    node_id=node_id,
-                    parent_session_id=parent_session_id,
-                )
-
-        editor = ThrottledTranscriptEditor(
-            platform=self.platform,
-            parse_mode=self._parse_mode(),
-            get_limit_chars=self._get_limit_chars,
-            transcript=transcript,
-            render_ctx=render_ctx,
-            node_id=node_id,
-            chat_id=chat_id,
-            status_msg_id=status_msg_id,
-            debug_platform_edits=self._debug_platform_edits,
-            log_messaging_error_details=self._log_messaging_error_details,
+        _recent, _semantic = await asyncio.gather(
+            fetch_recent(_kb_room, limit=3),
+            search_room(_kb_room, incoming.text, limit=3),
+        )
+        _context_prefix = build_context_prefix(dedupe(_recent + _semantic))
+        _prompt = (
+            f"{_context_prefix}\n\n[Current message]\n{incoming.text}"
+            if _context_prefix else incoming.text
         )
 
-        async def update_ui(status: str | None = None, force: bool = False) -> None:
-            await editor.update(status, force=force)
+        asyncio.ensure_future(store(
+            _kb_room, incoming.text, sender="user",
+            user_id=incoming.user_id, chat_id=incoming.chat_id,
+            platform=incoming.platform,
+        ))
 
+        _execute_reply: str | None = None
         try:
-            try:
-                (
-                    cli_session,
-                    session_or_temp_id,
-                    is_new,
-                ) = await self.cli_manager.get_or_create_session(
-                    session_id=parent_session_id
+            async with httpx.AsyncClient() as _http:
+                _resp = await _http.post(
+                    "http://localhost:8765/execute",
+                    json={"task": _prompt, "from": _kb_room},
+                    timeout=10.0,
                 )
-                if is_new:
-                    temp_session_id = session_or_temp_id
-                else:
-                    captured_session_id = session_or_temp_id
+                _resp.raise_for_status()
+                _task_id = _resp.json()["task_id"]
 
-                sess_evt = (
-                    "claude_cli.session.pending_created"
-                    if is_new
-                    else "claude_cli.session.reused"
+                _poll = await _http.get(
+                    f"http://localhost:8765/callback/{_task_id}",
+                    params={"timeout": "120"},
+                    timeout=130.0,
                 )
-                trace_event(
-                    stage="claude_cli",
-                    event=sess_evt,
-                    source=platform_nm,
-                    chat_id=chat_id,
-                    node_id=node_id,
-                    status_message_id=status_msg_id,
-                    session_handle=str(session_or_temp_id),
-                    parent_resume_session_id=parent_session_id,
-                    fork_requested=bool(parent_session_id),
-                )
-                trace_event(
-                    stage="claude_cli",
-                    event="claude_cli.request.sent",
-                    source=platform_nm,
-                    chat_id=chat_id,
-                    node_id=node_id,
-                    prompt=incoming.text,
-                    fork_session_arg=bool(parent_session_id),
-                    resume_session_arg=parent_session_id,
-                )
-            except RuntimeError as e:
-                error_message = get_user_facing_error_message(e)
-                transcript.apply({"type": "error", "message": error_message})
-                await update_ui(
-                    self.format_status("⏳", "Session limit reached"),
-                    force=True,
-                )
-                if tree:
-                    await tree.update_state(
-                        node_id,
-                        MessageState.ERROR,
-                        error_message=error_message,
-                    )
-                trace_event(
-                    stage="claude_cli",
-                    event="claude_cli.session.limit_reached",
-                    source=platform_nm,
-                    chat_id=chat_id,
-                    node_id=node_id,
-                )
-                return
+                _rec = _poll.json()
 
-            async for event_data in cli_session.start_task(
-                incoming.text,
-                session_id=parent_session_id,
-                fork_session=bool(parent_session_id),
-            ):
-                if not isinstance(event_data, dict):
-                    logger.warning(
-                        f"HANDLER: Non-dict event received: {type(event_data)}"
-                    )
-                    continue
-
-                (
-                    captured_session_id,
-                    temp_session_id,
-                ) = await handle_session_info_event(
-                    event_data,
-                    tree,
-                    node_id,
-                    captured_session_id,
-                    temp_session_id,
-                    cli_manager=self.cli_manager,
-                    session_store=self.session_store,
-                )
-                if event_data.get("type") == "session_info":
-                    continue
-
-                parsed_list = parse_cli_event(
-                    event_data, log_raw_cli=self._log_raw_cli_diagnostics
-                )
-
-                for parsed in parsed_list:
-                    (
-                        last_status,
-                        had_transcript_events,
-                    ) = await process_parsed_cli_event(
-                        parsed,
-                        transcript,
-                        update_ui,
-                        last_status,
-                        had_transcript_events,
-                        tree,
-                        node_id,
-                        captured_session_id,
-                        session_store=self.session_store,
-                        format_status=self.format_status,
-                        propagate_error_to_children=self._propagate_error_to_children,
-                        log_messaging_error_details=self._log_messaging_error_details,
-                    )
+            _execute_reply = (_rec.get("result") or _rec.get("reply") or "").strip()
+            _out = _execute_reply or "(no response)"
+            await self.platform.queue_edit_message(
+                chat_id, status_msg_id,
+                _out[:self._get_limit_chars()],
+                parse_mode=self._parse_mode(),
+                fire_and_forget=False,
+            )
+            if tree:
+                await tree.update_state(node_id, MessageState.COMPLETED)
 
         except asyncio.CancelledError:
-            trace_event(
-                stage="claude_cli",
-                event="turn.processor.cancelled",
-                source=platform_nm,
-                chat_id=chat_id,
-                node_id=node_id,
+            cancel_reason = node.context.get("cancel_reason") if isinstance(node.context, dict) else None
+            _status = self.format_status("⏹", "Stopped.") if cancel_reason == "stop" else self.format_status("❌", "Cancelled")
+            await self.platform.queue_edit_message(
+                chat_id, status_msg_id, _status, parse_mode=self._parse_mode(),
             )
-            logger.warning(f"HANDLER: Task cancelled for node {node_id}")
-            cancel_reason = None
-            if isinstance(node.context, dict):
-                cancel_reason = node.context.get("cancel_reason")
-
-            if cancel_reason == "stop":
-                await update_ui(self.format_status("⏹", "Stopped."), force=True)
-            else:
-                transcript.apply({"type": "error", "message": "Task was cancelled"})
-                await update_ui(self.format_status("❌", "Cancelled"), force=True)
-
-            # Do not propagate cancellation to children; a reply-scoped "/stop"
-            # should only stop the targeted task.
             if tree:
-                await tree.update_state(
-                    node_id, MessageState.ERROR, error_message="Cancelled by user"
-                )
+                await tree.update_state(node_id, MessageState.ERROR, error_message="Cancelled by user")
+            raise
         except Exception as e:
-            trace_event(
-                stage="claude_cli",
-                event="turn.processor.exception",
-                source=platform_nm,
-                chat_id=chat_id,
-                node_id=node_id,
-                exc_type=type(e).__name__,
+            logger.error("execute path failed node={}: {}", node_id, e)
+            await self.platform.queue_edit_message(
+                chat_id, status_msg_id,
+                self.format_status("💥", "Task Failed"), parse_mode=self._parse_mode(),
             )
-            logger.error(
-                "HANDLER: Task failed with exception: {}",
-                format_exception_for_log(
-                    e, log_full_message=self._log_messaging_error_details
-                ),
-            )
-            error_msg = format_user_error_preview(e)
-            transcript.apply({"type": "error", "message": error_msg})
-            await update_ui(self.format_status("💥", "Task Failed"), force=True)
             if tree:
-                await self._propagate_error_to_children(
-                    node_id, error_msg, "Parent task failed"
-                )
+                await self._propagate_error_to_children(node_id, str(e), "Parent task failed")
         finally:
             trace_event(
-                stage="routing",
-                event="turn.processor.finished",
-                source=platform_nm,
-                chat_id=chat_id,
-                node_id=node_id,
-                claude_session_id=captured_session_id or temp_session_id,
+                stage="routing", event="turn.processor.finished",
+                source=platform_nm, chat_id=chat_id, node_id=node_id,
             )
-            # Free the session-manager slot. Session IDs are persisted in the tree and
-            # can be resumed later by ID; we don't need to keep a CLISession instance
-            # around after this node completes.
-            try:
-                if captured_session_id:
-                    await self.cli_manager.remove_session(captured_session_id)
-                elif temp_session_id:
-                    await self.cli_manager.remove_session(temp_session_id)
-            except Exception as e:
-                logger.debug(
-                    "Failed to remove session for node {}: {}",
-                    node_id,
-                    format_exception_for_log(
-                        e, log_full_message=self._log_messaging_error_details
-                    ),
-                )
+            if _execute_reply:
+                asyncio.ensure_future(store(
+                    _kb_room, _execute_reply, sender="claude",
+                    user_id=incoming.user_id, chat_id=incoming.chat_id,
+                    platform=incoming.platform,
+                ))
 
     async def _propagate_error_to_children(
         self,

@@ -238,6 +238,15 @@ class AppRuntime:
                 )
 
     async def _start_message_handler(self) -> None:
+        platform = self.messaging_platform
+        assert platform is not None
+
+        # Telegram dispatches directly to /execute — no ClaudeMessageHandler needed.
+        if getattr(platform, "name", "") == "telegram":
+            await platform.start()
+            logger.info("telegram platform started (direct /execute mode)")
+            return
+
         from cli.manager import CLISessionManager
         from messaging.handler import ClaudeMessageHandler
         from messaging.session import SessionStore
@@ -272,8 +281,6 @@ class AppRuntime:
             storage_path=os.path.join(data_path, "sessions.json"),
             message_log_cap=self.settings.max_message_log_entries_per_chat,
         )
-        platform = self.messaging_platform
-        assert platform is not None
         self.message_handler = ClaudeMessageHandler(
             platform=platform,
             cli_manager=self.cli_manager,

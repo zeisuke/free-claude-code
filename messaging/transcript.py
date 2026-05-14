@@ -523,6 +523,13 @@ class TranscriptBuffer:
             self._segments.append(ErrorSegment(str(ev.get("message", ""))))
             return
 
+    def plain_text(self) -> str:
+        """Return concatenated text from all TextSegments (no markdown, no tool output)."""
+        return "\n".join(
+            seg.text for seg in self._segments
+            if isinstance(seg, TextSegment) and seg.text
+        )
+
     def render(self, ctx: RenderCtx, *, limit_chars: int, status: str | None) -> str:
         """Render transcript with truncation (drop oldest segments)."""
         # Filter out empty rendered segments.
