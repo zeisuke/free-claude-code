@@ -479,3 +479,27 @@ Server URL: http://127.0.0.1:8082
 Admin UI: http://127.0.0.1:8082/admin (local-only)
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8082 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [47068]
+/Users/kelvinleong/.local/share/uv/python/cpython-3.14.0-macos-aarch64-none/lib/python3.14/multiprocessing/resource_tracker.py:297: UserWarning: resource_tracker: There appear to be 8 leaked semaphore objects to clean up at shutdown: {'/mp-yffnzw46', '/mp-8uqq_6us', '/mp-hfttyt2c', '/mp-kf1rg_7c', '/mp-ei13liea', '/mp-yidqk85z', '/mp-amsqr38w', '/mp-5370e7v2'}
+  warnings.warn(
+INFO:     Started server process [69971]
+INFO:     Waiting for application startup.
+Server URL: http://127.0.0.1:8082
+Admin UI: http://127.0.0.1:8082/admin (local-only)
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8082 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [69971]
+/Users/kelvinleong/.local/share/uv/python/cpython-3.14.0-macos-aarch64-none/lib/python3.14/multiprocessing/resource_tracker.py:297: UserWarning: resource_tracker: There appear to be 8 leaked semaphore objects to clean up at shutdown: {'/mp-dw4ltibc', '/mp-936f0kwd', '/mp-kbzmwp9g', '/mp-g124dw9u', '/mp-1xxhkg7j', '/mp-esk8qf37', '/mp-_9ufqzb0', '/mp-9ve6bkp7'}
+  warnings.warn(
+INFO:     Started server process [70705]
+INFO:     Waiting for application startup.
+Server URL: http://127.0.0.1:8082
+Admin UI: http://127.0.0.1:8082/admin (local-only)
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8082 (Press CTRL+C to quit)
