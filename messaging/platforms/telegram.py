@@ -152,6 +152,22 @@ class TelegramPlatform(MessagingPlatform):
         self._application.add_handler(
             MessageHandler(filters.VOICE, self._on_telegram_voice)
         )
+        # Photo handler
+        self._application.add_handler(
+            MessageHandler(filters.PHOTO, self._on_telegram_photo)
+        )
+        # Video handler (includes video notes)
+        self._application.add_handler(
+            MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, self._on_telegram_video)
+        )
+        # Audio file handler
+        self._application.add_handler(
+            MessageHandler(filters.AUDIO, self._on_telegram_audio)
+        )
+        # Document handler (PDFs and other files)
+        self._application.add_handler(
+            MessageHandler(filters.Document.ALL, self._on_telegram_document)
+        )
 
         # Initialize internal components with retry logic
         max_retries = 3
@@ -724,3 +740,299 @@ class TelegramPlatform(MessagingPlatform):
         finally:
             with contextlib.suppress(OSError):
                 tmp_path.unlink(missing_ok=True)
+
+    def _check_auth(self, update: "Update") -> tuple[str, str] | None:
+        """Return (user_id, chat_id) if authorized, else None (and log warning)."""
+        if not update.effective_user or not update.effective_chat:
+            return None
+        user_id = str(update.effective_user.id)
+        chat_id = str(update.effective_chat.id)
+        if self.allowed_user_id and user_id != str(self.allowed_user_id).strip():
+            logger.warning("Unauthorized media access attempt from {}", user_id)
+            return None
+        return user_id, chat_id
+
+    def _thread_id(self, update: "Update") -> str | None:
+        return (
+            str(update.message.message_thread_id)
+            if update.message and getattr(update.message, "message_thread_id", None) is not None
+            else None
+        )
+
+    async def _on_telegram_photo(
+        self, update: "Update", context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle incoming photos — analyse via Ollama vision and dispatch as text."""
+        if not update.message or not update.message.photo:
+            return
+        auth = self._check_auth(update)
+        if not auth:
+            return
+        user_id, chat_id = auth
+        thread_id = self._thread_id(update)
+        message_id = str(update.message.message_id)
+        caption = update.message.caption or ""
+
+        status_mid = await self.queue_send_message(
+            chat_id,
+            format_status("🖼️", "Analysing image\\.\\.\\."),
+            reply_to=message_id,
+            parse_mode="MarkdownV2",
+            fire_and_forget=False,
+            message_thread_id=thread_id,
+        )
+
+        from ..media_helpers import analyze_image_ollama
+
+        # Use the largest available photo
+        photo = update.message.photo[-1]
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tg_file = await context.bot.get_file(photo.file_id)
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+
+            prompt = caption.strip() or "Describe this image in detail."
+            description = await analyze_image_ollama(tmp_path, prompt)
+
+            task_text = f"[Image from user]\n{description}"
+            if caption:
+                task_text += f"\n\nUser caption: {caption}"
+
+            incoming = IncomingMessage(
+                text=task_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                platform="telegram",
+                message_thread_id=thread_id,
+                raw_event=update,
+                status_message_id=status_mid,
+            )
+            await self._dispatch_to_execute(incoming)
+        except Exception as exc:
+            logger.error("Photo handler failed: {}", exc)
+            with contextlib.suppress(Exception):
+                await self.queue_edit_message(
+                    chat_id, str(status_mid),
+                    "❌ Image analysis failed\\.",
+                    parse_mode="MarkdownV2",
+                )
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+
+    async def _on_telegram_video(
+        self, update: "Update", context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle incoming videos — extract frames, analyse via vision, dispatch as text."""
+        if not update.message:
+            return
+        video = update.message.video or update.message.video_note
+        if not video:
+            return
+        auth = self._check_auth(update)
+        if not auth:
+            return
+        user_id, chat_id = auth
+        thread_id = self._thread_id(update)
+        message_id = str(update.message.message_id)
+        caption = getattr(update.message, "caption", None) or ""
+
+        status_mid = await self.queue_send_message(
+            chat_id,
+            format_status("🎬", "Analysing video frames\\.\\.\\."),
+            reply_to=message_id,
+            parse_mode="MarkdownV2",
+            fire_and_forget=False,
+            message_thread_id=thread_id,
+        )
+
+        from ..media_helpers import analyze_video_frames
+
+        suffix = ".mp4"
+        if hasattr(video, "mime_type") and video.mime_type:
+            if "webm" in video.mime_type:
+                suffix = ".webm"
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tg_file = await context.bot.get_file(video.file_id)
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+
+            prompt = caption.strip() or "Describe this video in detail."
+            analysis = await analyze_video_frames(tmp_path, prompt)
+
+            task_text = f"[Video from user]\n{analysis}"
+            if caption:
+                task_text += f"\n\nUser caption: {caption}"
+
+            incoming = IncomingMessage(
+                text=task_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                platform="telegram",
+                message_thread_id=thread_id,
+                raw_event=update,
+                status_message_id=status_mid,
+            )
+            await self._dispatch_to_execute(incoming)
+        except Exception as exc:
+            logger.error("Video handler failed: {}", exc)
+            with contextlib.suppress(Exception):
+                await self.queue_edit_message(
+                    chat_id, str(status_mid),
+                    "❌ Video analysis failed\\.",
+                    parse_mode="MarkdownV2",
+                )
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+
+    async def _on_telegram_audio(
+        self, update: "Update", context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle audio files — transcribe via STT and dispatch as text."""
+        if not update.message or not update.message.audio:
+            return
+        auth = self._check_auth(update)
+        if not auth:
+            return
+        user_id, chat_id = auth
+        thread_id = self._thread_id(update)
+        message_id = str(update.message.message_id)
+        caption = update.message.caption or ""
+
+        status_mid = await self.queue_send_message(
+            chat_id,
+            format_status("🎵", "Transcribing audio\\.\\.\\."),
+            reply_to=message_id,
+            parse_mode="MarkdownV2",
+            fire_and_forget=False,
+            message_thread_id=thread_id,
+        )
+
+        audio = update.message.audio
+        mime = audio.mime_type or "audio/mpeg"
+        suffix_map = {"audio/ogg": ".ogg", "audio/mp4": ".mp4", "audio/x-wav": ".wav",
+                      "audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/mp3": ".mp3"}
+        suffix = suffix_map.get(mime, ".mp3")
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tg_file = await context.bot.get_file(audio.file_id)
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+
+            transcribed = await self._voice_transcription.transcribe(
+                tmp_path, mime,
+                whisper_model=self._whisper_model,
+                whisper_device=self._whisper_device,
+            )
+
+            task_text = transcribed
+            if caption:
+                task_text = f"{caption}\n\n[Audio transcript: {transcribed}]"
+
+            incoming = IncomingMessage(
+                text=task_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                platform="telegram",
+                message_thread_id=thread_id,
+                raw_event=update,
+                status_message_id=status_mid,
+            )
+            await self._dispatch_to_execute(incoming)
+        except Exception as exc:
+            logger.error("Audio handler failed: {}", exc)
+            with contextlib.suppress(Exception):
+                await self.queue_edit_message(
+                    chat_id, str(status_mid),
+                    "❌ Audio transcription failed\\. Please send text instead\\.",
+                    parse_mode="MarkdownV2",
+                )
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+
+    async def _on_telegram_document(
+        self, update: "Update", context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle document uploads — extract text for PDFs, pass path for others."""
+        if not update.message or not update.message.document:
+            return
+        auth = self._check_auth(update)
+        if not auth:
+            return
+        user_id, chat_id = auth
+        thread_id = self._thread_id(update)
+        message_id = str(update.message.message_id)
+        caption = update.message.caption or ""
+        doc = update.message.document
+        mime = doc.mime_type or ""
+        file_name = doc.file_name or "document"
+
+        status_mid = await self.queue_send_message(
+            chat_id,
+            format_status("📄", "Processing document\\.\\.\\."),
+            reply_to=message_id,
+            parse_mode="MarkdownV2",
+            fire_and_forget=False,
+            message_thread_id=thread_id,
+        )
+
+        suffix = Path(file_name).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+
+            if mime == "application/pdf" or suffix.lower() == ".pdf":
+                from ..media_helpers import extract_pdf_text
+                extracted = extract_pdf_text(tmp_path)
+                task_text = (
+                    f"[PDF document: '{file_name}']\n\n"
+                    f"Extracted text:\n{extracted}"
+                )
+            elif mime.startswith("text/") or suffix.lower() in (
+                ".txt", ".md", ".csv", ".log", ".json", ".xml",
+                ".yaml", ".yml", ".toml", ".ini", ".cfg",
+            ):
+                try:
+                    extracted = tmp_path.read_text(encoding="utf-8", errors="replace")[:8000]
+                    task_text = f"[Text document: '{file_name}']\n\n{extracted}"
+                except Exception:
+                    task_text = f"[Document: '{file_name}' saved at {tmp_path}. Ask user what to do with it.]"
+            else:
+                task_text = (
+                    f"[Document: '{file_name}' (type: {mime or 'unknown'}) "
+                    f"saved at {tmp_path}. Ask the user what they'd like to do with it.]"
+                )
+
+            if caption:
+                task_text = f"{caption}\n\n{task_text}"
+
+            incoming = IncomingMessage(
+                text=task_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                platform="telegram",
+                message_thread_id=thread_id,
+                raw_event=update,
+                status_message_id=status_mid,
+            )
+            await self._dispatch_to_execute(incoming)
+        except Exception as exc:
+            logger.error("Document handler failed: {}", exc)
+            with contextlib.suppress(Exception):
+                await self.queue_edit_message(
+                    chat_id, str(status_mid),
+                    "❌ Document processing failed\\.",
+                    parse_mode="MarkdownV2",
+                )
