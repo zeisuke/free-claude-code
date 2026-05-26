@@ -114,6 +114,11 @@ async def _pool_stream(
     """
     timeout = settings.model_pool_first_token_timeout
     ordered = _cb.pick_models(pool)
+    # Respect the model router's decision: if the resolved model is in the pool, try it first.
+    _req_model = base_request.model
+    _pool_match = next((m for m in pool if Settings.parse_model_name(m) == _req_model), None)
+    if _pool_match and ordered and ordered[0] != _pool_match:
+        ordered = [_pool_match] + [m for m in ordered if m != _pool_match]
     last_err_chunk: str | None = None
 
     for model_ref in ordered:

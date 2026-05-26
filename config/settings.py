@@ -179,8 +179,9 @@ class Settings(BaseSettings):
     model_pool_raw: str = Field(default="", validation_alias="MODEL_POOL")
 
     # How long (seconds) to wait for the first SSE token before penalising a pool model.
+    # 30s default to accommodate local 8B models (gemma4) with long prompts/tool lists.
     model_pool_first_token_timeout: float = Field(
-        default=8.0, validation_alias="MODEL_POOL_FIRST_TOKEN_TIMEOUT"
+        default=30.0, validation_alias="MODEL_POOL_FIRST_TOKEN_TIMEOUT"
     )
 
     @property

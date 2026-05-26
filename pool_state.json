@@ -1,1 +1,5 @@
-{"cooldowns": {}, "last_used_model": "ollama/qwen3:8b", "last_used_ts": null}
+{
+  "cooldowns": {},
+  "last_used_model": "ollama/qwen2.5:0.5b",
+  "last_used_ts": null
+}

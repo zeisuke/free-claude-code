@@ -52,25 +52,54 @@ def _tool_input_schema(tool: Any) -> dict[str, Any]:
     return {"type": "object", "properties": {}}
 
 
-def _serialize_tool_result_content(tool_content: Any) -> str:
-    """Serialize tool_result content for OpenAI ``role: tool`` messages (stable JSON for structured values)."""
+def _serialize_tool_result_content(tool_content: Any) -> "str | list":
+    """Serialize tool_result content for OpenAI ``role: tool`` messages.
+
+    Returns a list when image blocks are present (OpenAI multimodal content),
+    otherwise returns a plain string.
+    """
     if tool_content is None:
         return ""
     if isinstance(tool_content, str):
         return tool_content
     if isinstance(tool_content, dict):
+        if tool_content.get("type") == "image":
+            return [_image_block_to_openai(tool_content)]
         return json.dumps(tool_content, ensure_ascii=False)
     if isinstance(tool_content, list):
-        parts: list[str] = []
+        text_parts: list[str] = []
+        image_items: list[dict[str, Any]] = []
         for item in tool_content:
             if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
+                text_parts.append(str(item.get("text", "")))
+            elif isinstance(item, dict) and item.get("type") == "image":
+                image_items.append(_image_block_to_openai(item))
             elif isinstance(item, dict):
-                parts.append(json.dumps(item, ensure_ascii=False))
+                text_parts.append(json.dumps(item, ensure_ascii=False))
             else:
-                parts.append(str(item))
-        return "\n".join(parts)
+                text_parts.append(str(item))
+        if image_items:
+            content: list[dict[str, Any]] = []
+            if text_parts:
+                content.append({"type": "text", "text": "\n".join(text_parts)})
+            content.extend(image_items)
+            return content
+        return "\n".join(text_parts)
     return str(tool_content)
+
+
+def _image_block_to_openai(block: Any) -> dict[str, Any]:
+    """Convert an Anthropic image block to OpenAI image_url format for Ollama."""
+    source = block.get("source", {}) if isinstance(block, dict) else {}
+    if not isinstance(source, dict):
+        source = {}
+    src_type = source.get("type", "")
+    if src_type == "base64":
+        url = f"data:{source.get('media_type', 'image/jpeg')};base64,{source.get('data', '')}"
+        return {"type": "image_url", "image_url": {"url": url}}
+    if src_type == "url":
+        return {"type": "image_url", "image_url": {"url": source.get("url", "")}}
+    return {"type": "text", "text": "[image: unsupported source type]"}
 
 
 def _clean_reasoning_content(value: Any) -> str | None:
@@ -420,10 +449,21 @@ class AnthropicToOpenAIConverter:
 
         result: list[dict[str, Any]] = []
         text_parts: list[str] = []
+        mm_parts: list[dict[str, Any]] = []
+        has_image = False
         cleared = False
 
         def flush_text() -> None:
-            if text_parts:
+            nonlocal has_image
+            if has_image:
+                if text_parts:
+                    mm_parts.append({"type": "text", "text": "\n".join(text_parts)})
+                    text_parts.clear()
+                if mm_parts:
+                    result.append({"role": "user", "content": mm_parts.copy()})
+                    mm_parts.clear()
+                has_image = False
+            elif text_parts:
                 result.append({"role": "user", "content": "\n".join(text_parts)})
                 text_parts.clear()
 
@@ -432,11 +472,13 @@ class AnthropicToOpenAIConverter:
             if block_type == "text":
                 text_parts.append(get_block_attr(block, "text", ""))
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
-                )
+                has_image = True
+                if text_parts:
+                    mm_parts.append({"type": "text", "text": "\n".join(text_parts)})
+                    text_parts.clear()
+                mm_parts.append(_image_block_to_openai(
+                    block if isinstance(block, dict) else {}
+                ))
             elif block_type == "tool_result":
                 flush_text()
                 tool_content = get_block_attr(block, "content", "")
@@ -470,9 +512,20 @@ class AnthropicToOpenAIConverter:
     def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         text_parts: list[str] = []
+        mm_parts: list[dict[str, Any]] = []  # multimodal content parts
+        has_image = False
 
         def flush_text() -> None:
-            if text_parts:
+            nonlocal has_image
+            if has_image:
+                if text_parts:
+                    mm_parts.append({"type": "text", "text": "\n".join(text_parts)})
+                    text_parts.clear()
+                if mm_parts:
+                    result.append({"role": "user", "content": mm_parts.copy()})
+                    mm_parts.clear()
+                has_image = False
+            elif text_parts:
                 result.append({"role": "user", "content": "\n".join(text_parts)})
                 text_parts.clear()
 
@@ -482,11 +535,13 @@ class AnthropicToOpenAIConverter:
             if block_type == "text":
                 text_parts.append(get_block_attr(block, "text", ""))
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
-                )
+                has_image = True
+                if text_parts:
+                    mm_parts.append({"type": "text", "text": "\n".join(text_parts)})
+                    text_parts.clear()
+                mm_parts.append(_image_block_to_openai(
+                    block if isinstance(block, dict) else {}
+                ))
             elif block_type == "tool_result":
                 flush_text()
                 tool_content = get_block_attr(block, "content", "")
