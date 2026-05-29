@@ -43,6 +43,61 @@ ProviderGetter = Callable[[str], BaseProvider]
 _OPENAI_CHAT_UPSTREAM_IDS = frozenset({"nvidia_nim", "opencode", "opencode_go"})
 
 
+async def _accumulate_sse_to_json(stream: AsyncIterator[str]):
+    """Accumulate SSE stream into a non-streaming Anthropic JSON Message response."""
+    from fastapi.responses import JSONResponse
+    import json as _json
+
+    msg_id = None
+    model = None
+    stop_reason = "end_turn"
+    text_parts: list[str] = []
+    input_tokens = 0
+    output_tokens = 0
+
+    async for chunk in stream:
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8")
+        for line in chunk.splitlines():
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data in ("", "[DONE]"):
+                continue
+            try:
+                ev = _json.loads(data)
+            except Exception:
+                continue
+            t = ev.get("type", "")
+            if t == "message_start":
+                msg = ev.get("message", {})
+                msg_id = msg.get("id")
+                model = msg.get("model")
+                usage = msg.get("usage", {})
+                input_tokens = usage.get("input_tokens", 0)
+            elif t == "content_block_delta":
+                delta = ev.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text_parts.append(delta.get("text", ""))
+            elif t == "message_delta":
+                delta = ev.get("delta", {})
+                stop_reason = delta.get("stop_reason", stop_reason)
+                usage = ev.get("usage", {})
+                output_tokens = usage.get("output_tokens", 0)
+
+    body = {
+        "id": msg_id or f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "".join(text_parts)}],
+        "model": model or "unknown",
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
+    return JSONResponse(content=body)
+
+
 def anthropic_sse_streaming_response(
     body: AsyncIterator[str],
 ) -> StreamingResponse:

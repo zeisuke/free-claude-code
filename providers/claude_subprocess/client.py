@@ -41,6 +41,25 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _SUBPROCESS_TIMEOUT = 120  # seconds
 
 
+async def _is_fcc_active() -> bool:
+    """Check if FCC fallback mode is active via search_api /fcc-status.
+
+    Returns False on any error (fail open — assume inactive, try claude -p).
+    """
+    try:
+        import urllib.request as _ur
+        import json as _j
+        loop = asyncio.get_event_loop()
+
+        def _check():
+            with _ur.urlopen("http://localhost:8765/fcc-status", timeout=1.0) as _r:
+                return _j.loads(_r.read()).get("fcc_active", False)
+
+        return await loop.run_in_executor(None, _check)
+    except Exception:
+        return False
+
+
 class ClaudeSubprocessProvider(BaseProvider):
     """Spawns 'claude -p' for Claude-quality responses; Ollama fallback on failure."""
 
@@ -58,6 +77,11 @@ class ClaudeSubprocessProvider(BaseProvider):
         request_id: str | None = None,
         thinking_enabled: bool | None = None,
     ) -> AsyncIterator[str]:
+        if await _is_fcc_active():
+            logger.info("claude_subprocess: FCC active — routing directly to Ollama")
+            async for chunk in self._ollama_stream(request, input_tokens, request_id=request_id):
+                yield chunk
+            return
         try:
             async for chunk in self._subprocess_stream(request, input_tokens):
                 yield chunk
@@ -83,18 +107,37 @@ class ClaudeSubprocessProvider(BaseProvider):
                 "You may emit multiple tool calls. Add explanatory text outside the tags."
             )
 
-        prompt = _build_conversation_text(request.messages)
+        prompt, image_paths = _build_conversation_text(request.messages)
         claude_model = _resolve_claude_model(request.model)
+
+        # Build system prompt: append image instruction when images are present
+        final_system = system_text or ""
+        if image_paths:
+            img_instr = (
+                "IMAGE INSTRUCTION: This message contains [image: /path] reference(s). "
+                "Use the Read tool to load and view each image file, then respond based on what you see."
+            )
+            final_system = (final_system + "\n\n" + img_instr).strip()
 
         cmd = [
             "claude", "-p",
             "--model", claude_model,
             "--dangerously-skip-permissions",
             "--no-session-persistence",
+            "--output-format", "text",
             "--max-turns", "10",
         ]
-        if system_text:
-            cmd += ["--system-prompt", system_text]
+        if final_system:
+            cmd += ["--system-prompt", final_system]
+        # Add image directories so claude -p can read [image: path] references via Read tool
+        seen_dirs: set[str] = set()
+        for img_path in image_paths:
+            img_dir = os.path.dirname(img_path)
+            if img_dir and img_dir not in seen_dirs:
+                cmd += ["--add-dir", img_dir]
+                seen_dirs.add(img_dir)
+        if image_paths:
+            cmd.append("--")  # separate variadic --add-dir dirs from the prompt argument
         cmd.append(prompt)
 
         proc = await asyncio.create_subprocess_exec(
@@ -175,8 +218,75 @@ def _extract_system_text(system: Any) -> str:
     return "\n".join(parts)
 
 
-def _build_conversation_text(messages: list[Any]) -> str:
+def _extract_image_path(block: Any) -> str | None:
+    """Extract or save an image block to disk; return local file path or None.
+
+    Handles both Anthropic format (type=image, source=...) and
+    OpenAI format (type=image_url, image_url.url=data:... or file://...).
+    """
+    import base64 as _b64, hashlib as _hs
+
+    block_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+
+    # OpenAI-style image_url block: {"type": "image_url", "image_url": {"url": "data:..."}}
+    if block_type == "image_url":
+        img_url_obj = getattr(block, "image_url", None) or (block.get("image_url") if isinstance(block, dict) else None)
+        url = getattr(img_url_obj, "url", None) or (img_url_obj.get("url") if isinstance(img_url_obj, dict) else None) or ""
+        if url.startswith("file://"):
+            return url[7:]
+        if url.startswith("data:"):
+            try:
+                header, data = url.split(",", 1)
+                media_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
+                ext = media_type.split("/")[-1] if "/" in media_type else "jpg"
+                tmp_dir = "/tmp/fcc_images"
+                os.makedirs(tmp_dir, exist_ok=True)
+                fname = f"img_{_hs.md5(data[:100].encode()).hexdigest()[:12]}.{ext}"
+                fpath = os.path.join(tmp_dir, fname)
+                if not os.path.exists(fpath):
+                    with open(fpath, "wb") as _f:
+                        _f.write(_b64.b64decode(data))
+                return fpath
+            except Exception:
+                return None
+        return None
+
+    # Anthropic-style image block: {"type": "image", "source": {"type": "base64", ...}}
+    source = getattr(block, "source", None) or (block.get("source") if isinstance(block, dict) else None)
+    if not source:
+        return None
+    src_type = getattr(source, "type", None) or (source.get("type") if isinstance(source, dict) else None)
+    if src_type == "url":
+        url = getattr(source, "url", "") or (source.get("url", "") if isinstance(source, dict) else "")
+        if url.startswith("file://"):
+            return url[7:]
+    elif src_type == "base64":
+        data = getattr(source, "data", "") or (source.get("data", "") if isinstance(source, dict) else "")
+        media_type = getattr(source, "media_type", "image/jpeg") or (source.get("media_type", "image/jpeg") if isinstance(source, dict) else "image/jpeg")
+        ext = media_type.split("/")[-1] if "/" in media_type else "jpg"
+        tmp_dir = "/tmp/fcc_images"
+        os.makedirs(tmp_dir, exist_ok=True)
+        fname = f"img_{_hs.md5(data[:100].encode()).hexdigest()[:12]}.{ext}"
+        fpath = os.path.join(tmp_dir, fname)
+        if not os.path.exists(fpath):
+            with open(fpath, "wb") as _f:
+                _f.write(_b64.b64decode(data))
+        return fpath
+    return None
+
+
+def _build_conversation_text(messages: list[Any]) -> tuple[str, list[str]]:
+    """Returns (conversation_text, image_paths) where image_paths are local files to add.
+
+    Extracts images from:
+    1. API-level image blocks (Anthropic format or OpenAI image_url format)
+    2. [image: /path] text references in message content
+    """
+    import re as _re
+    _IMAGE_REF_RE = _re.compile(r'\[image:\s*(/[^\]]+)\]')
+
     parts = []
+    image_paths: list[str] = []
     for msg in messages:
         role = str(getattr(msg, "role", "user")).capitalize()
         content = msg.content
@@ -188,6 +298,11 @@ def _build_conversation_text(messages: list[Any]) -> str:
                 if hasattr(block, "type"):
                     if block.type == "text":
                         texts.append(block.text)
+                    elif block.type == "image":
+                        img_path = _extract_image_path(block)
+                        if img_path:
+                            texts.append(f"[image: {img_path}]")
+                            image_paths.append(img_path)
                     elif block.type == "tool_result":
                         rc = block.content
                         texts.append(f"[Tool result: {rc if isinstance(rc, str) else json.dumps(rc)}]")
@@ -196,11 +311,21 @@ def _build_conversation_text(messages: list[Any]) -> str:
                 elif isinstance(block, dict):
                     if block.get("type") == "text":
                         texts.append(block.get("text", ""))
+                    elif block.get("type") == "image":
+                        img_path = _extract_image_path(block)
+                        if img_path:
+                            texts.append(f"[image: {img_path}]")
+                            image_paths.append(img_path)
             text = "\n".join(texts)
         else:
             text = str(content)
+        # Extract [image: /path] text references
+        for _m in _IMAGE_REF_RE.finditer(text):
+            _img_path = _m.group(1).strip()
+            if os.path.isfile(_img_path) and _img_path not in image_paths:
+                image_paths.append(_img_path)
         parts.append(f"{role}: {text}")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), image_paths
 
 
 def _parse_content(text: str) -> list[dict[str, Any]]:

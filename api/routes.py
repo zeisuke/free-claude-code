@@ -177,8 +177,14 @@ async def create_message(
     service: ClaudeProxyService = Depends(get_proxy_service),
     _auth=Depends(require_api_key),
 ):
-    """Create a message (always streaming)."""
-    return service.create_message(request_data)
+    """Create a message — streaming by default, JSON for stream=false."""
+    response = service.create_message(request_data)
+    if request_data.stream is not True:  # None (omitted) or False → non-streaming JSON
+        from api.services import _accumulate_sse_to_json
+        # StreamingResponse wraps the async generator; extract it for accumulation
+        stream = getattr(response, "body_iterator", None) or response
+        return await _accumulate_sse_to_json(stream)
+    return response
 
 
 @router.api_route("/v1/messages", methods=["HEAD", "OPTIONS"])

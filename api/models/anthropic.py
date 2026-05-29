@@ -31,6 +31,12 @@ class ContentBlockImage(_AnthropicBlockBase):
     source: dict[str, Any]
 
 
+class ContentBlockImageUrl(_AnthropicBlockBase):
+    """OpenAI-style image_url block — accepted from vision_analyze_tool callers."""
+    type: Literal["image_url"]
+    image_url: dict[str, Any]
+
+
 class ContentBlockDocument(_AnthropicBlockBase):
     """Anthropic document block (e.g. PDF files via the Files API)."""
 
@@ -98,6 +104,7 @@ class Message(BaseModel):
         | list[
             ContentBlockText
             | ContentBlockImage
+            | ContentBlockImageUrl
             | ContentBlockDocument
             | ContentBlockToolUse
             | ContentBlockToolResult
@@ -140,7 +147,7 @@ class MessagesRequest(BaseModel):
     messages: list[Message]
     system: str | list[SystemContent] | None = None
     stop_sequences: list[str] | None = None
-    stream: bool | None = True
+    stream: bool | None = None  # None = non-streaming (SDK omits field); True = SSE streaming
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
