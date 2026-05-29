@@ -1,5 +1,7 @@
 """Tests for config/settings.py and config/nim.py"""
 
+from typing import Any, cast
+
 import pytest
 from pydantic import ValidationError
 
@@ -24,6 +26,7 @@ class TestSettings:
         """Test default values are set and have correct types."""
         from config.settings import Settings
 
+        monkeypatch.delenv("CLAUDE_WORKSPACE", raising=False)
         monkeypatch.delenv("MODEL", raising=False)
         monkeypatch.delenv("HTTP_READ_TIMEOUT", raising=False)
         monkeypatch.delenv("HTTP_CONNECT_TIMEOUT", raising=False)
@@ -42,6 +45,109 @@ class TestSettings:
         assert settings.log_raw_sse_events is False
         assert settings.debug_platform_edits is False
         assert settings.debug_subagent_stack is False
+
+    def test_default_claude_workspace_uses_fcc_home(self, monkeypatch, tmp_path):
+        """Unset CLAUDE_WORKSPACE stores agent data under ~/.fcc."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_WORKSPACE", raising=False)
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings()
+
+        assert settings.claude_workspace == str(tmp_path / ".fcc" / "agent_workspace")
+
+    def test_server_log_path_uses_fcc_home(self, monkeypatch, tmp_path):
+        """The server log location is fixed under ~/.fcc."""
+        from config.paths import server_log_path
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+        assert server_log_path() == tmp_path / ".fcc" / "logs" / "server.log"
+
+    def test_removed_log_file_env_is_ignored(self, monkeypatch):
+        """Legacy LOG_FILE values do not affect Settings or block startup."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("LOG_FILE", "custom/server.log")
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings()
+
+        assert not hasattr(settings, "log_file")
+
+    def test_stale_zai_base_url_env_is_ignored(self, monkeypatch):
+        """Cloud Z.ai endpoint is fixed in provider metadata, not settings."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("ZAI_BASE_URL", "https://custom.zai.invalid/v1")
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings()
+
+        assert not hasattr(settings, "zai_base_url")
+
+    def test_blank_claude_workspace_uses_fcc_home(self, monkeypatch, tmp_path):
+        """An explicit blank env value does not affect the fixed workspace path."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_WORKSPACE", "")
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings()
+
+        assert settings.claude_workspace == str(tmp_path / ".fcc" / "agent_workspace")
+
+    def test_explicit_claude_workspace_is_ignored(self, monkeypatch, tmp_path):
+        """Custom CLAUDE_WORKSPACE values do not override the fixed workspace."""
+        from config.settings import Settings
+
+        workspace = tmp_path / "custom-workspace"
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_WORKSPACE", str(workspace))
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings()
+
+        assert settings.claude_workspace == str(tmp_path / ".fcc" / "agent_workspace")
+
+    def test_explicit_claude_cli_bin_is_ignored(self, monkeypatch):
+        """Custom CLAUDE_CLI_BIN values do not override the fixed binary."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("CLAUDE_CLI_BIN", "claude-custom")
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings()
+
+        assert settings.claude_cli_bin == "claude"
+
+    def test_direct_claude_runtime_overrides_are_ignored(self, monkeypatch, tmp_path):
+        """Constructor extras cannot override fixed Claude runtime settings."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+
+        settings = Settings(
+            **cast(
+                Any,
+                {
+                    "claude_workspace": str(tmp_path / "custom-workspace"),
+                    "claude_cli_bin": "claude-custom",
+                },
+            )
+        )
+
+        assert settings.claude_workspace == str(tmp_path / ".fcc" / "agent_workspace")
+        assert settings.claude_cli_bin == "claude"
 
     def test_get_settings_cached(self):
         """Test get_settings returns cached instance."""
@@ -652,22 +758,48 @@ class TestPerModelMapping:
 
         assert Settings.parse_provider_type("nvidia_nim/meta/llama") == "nvidia_nim"
         assert Settings.parse_provider_type("open_router/deepseek/r1") == "open_router"
+        assert (
+            Settings.parse_provider_type("mistral/devstral-small-latest") == "mistral"
+        )
+        assert (
+            Settings.parse_provider_type("mistral_codestral/codestral-latest")
+            == "mistral_codestral"
+        )
         assert Settings.parse_provider_type("deepseek/deepseek-chat") == "deepseek"
         assert Settings.parse_provider_type("lmstudio/qwen") == "lmstudio"
         assert Settings.parse_provider_type("llamacpp/model") == "llamacpp"
         assert Settings.parse_provider_type("ollama/llama3.1") == "ollama"
         assert Settings.parse_provider_type("wafer/DeepSeek-V4-Pro") == "wafer"
+        assert Settings.parse_provider_type("gemini/gemini-2.5-flash") == "gemini"
+        assert Settings.parse_provider_type("groq/llama-3.3-70b-versatile") == "groq"
+        assert Settings.parse_provider_type("cerebras/llama3.1-8b") == "cerebras"
 
     def test_parse_model_name(self):
         """parse_model_name extracts model name from model string."""
         from config.settings import Settings
 
         assert Settings.parse_model_name("nvidia_nim/meta/llama") == "meta/llama"
+        assert (
+            Settings.parse_model_name("mistral/devstral-small-latest")
+            == "devstral-small-latest"
+        )
+        assert (
+            Settings.parse_model_name("mistral_codestral/codestral-latest")
+            == "codestral-latest"
+        )
         assert Settings.parse_model_name("deepseek/deepseek-chat") == "deepseek-chat"
         assert Settings.parse_model_name("lmstudio/qwen") == "qwen"
         assert Settings.parse_model_name("llamacpp/model") == "model"
         assert Settings.parse_model_name("ollama/llama3.1") == "llama3.1"
         assert Settings.parse_model_name("wafer/DeepSeek-V4-Pro") == "DeepSeek-V4-Pro"
+        assert (
+            Settings.parse_model_name("gemini/gemini-2.5-flash") == "gemini-2.5-flash"
+        )
+        assert (
+            Settings.parse_model_name("groq/llama-3.3-70b-versatile")
+            == "llama-3.3-70b-versatile"
+        )
+        assert Settings.parse_model_name("cerebras/llama3.1-8b") == "llama3.1-8b"
 
     def test_configured_chat_model_refs_collects_unique_models_with_sources(
         self, monkeypatch

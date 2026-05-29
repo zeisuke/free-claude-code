@@ -15,9 +15,14 @@ from api.dependencies import (
     resolve_provider,
 )
 from config.nim import NimSettings
+from providers.cerebras import CerebrasProvider
+from providers.codestral import CodestralProvider
 from providers.deepseek import DeepSeekProvider
 from providers.exceptions import ServiceUnavailableError, UnknownProviderTypeError
+from providers.gemini import GeminiProvider
+from providers.groq import GroqProvider
 from providers.lmstudio import LMStudioProvider
+from providers.mistral import MistralProvider
 from providers.nvidia_nim import NvidiaNimProvider
 from providers.ollama import OllamaProvider
 from providers.open_router import OpenRouterProvider
@@ -35,16 +40,34 @@ def _make_mock_settings(**overrides):
     mock.provider_rate_window = 60
     mock.provider_max_concurrency = 5
     mock.open_router_api_key = "test_openrouter_key"
+    mock.mistral_api_key = "test_mistral_key"
+    mock.codestral_api_key = "test_codestral_key"
     mock.deepseek_api_key = "test_deepseek_key"
     mock.wafer_api_key = "test_wafer_key"
     mock.opencode_api_key = "test_opencode_key"
+    mock.zai_api_key = "test_zai_key"
     mock.lm_studio_base_url = "http://localhost:1234/v1"
+    mock.llamacpp_base_url = "http://localhost:8080/v1"
     mock.ollama_base_url = "http://localhost:11434"
+    mock.nvidia_nim_proxy = ""
+    mock.open_router_proxy = ""
+    mock.mistral_proxy = ""
+    mock.codestral_proxy = ""
     mock.lmstudio_proxy = ""
     mock.llamacpp_proxy = ""
     mock.kimi_proxy = ""
     mock.wafer_proxy = ""
     mock.opencode_proxy = ""
+    mock.opencode_go_proxy = ""
+    mock.zai_proxy = ""
+    mock.fireworks_api_key = ""
+    mock.fireworks_proxy = ""
+    mock.gemini_api_key = ""
+    mock.gemini_proxy = ""
+    mock.groq_api_key = ""
+    mock.groq_proxy = ""
+    mock.cerebras_api_key = ""
+    mock.cerebras_proxy = ""
     mock.nim = NimSettings()
     mock.http_read_timeout = 300.0
     mock.http_write_timeout = 10.0
@@ -197,6 +220,135 @@ async def test_get_provider_deepseek_passes_enable_model_thinking():
 
 
 @pytest.mark.asyncio
+async def test_get_provider_mistral():
+    """Test that provider_type=mistral returns MistralProvider."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(provider_type="mistral")
+
+        provider = get_provider()
+
+        assert isinstance(provider, MistralProvider)
+        assert provider._base_url == "https://api.mistral.ai/v1"
+        assert provider._api_key == "test_mistral_key"
+
+
+@pytest.mark.asyncio
+async def test_get_provider_mistral_codestral():
+    """provider_type=mistral_codestral returns CodestralProvider."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="mistral_codestral",
+        )
+
+        provider = get_provider()
+
+        assert isinstance(provider, CodestralProvider)
+        assert provider._base_url == "https://codestral.mistral.ai/v1"
+        assert provider._api_key == "test_codestral_key"
+
+
+@pytest.mark.asyncio
+async def test_get_provider_gemini():
+    """Test that provider_type=gemini returns GeminiProvider."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="gemini",
+            gemini_api_key="secret",
+        )
+
+        provider = get_provider()
+
+        assert isinstance(provider, GeminiProvider)
+        assert provider._base_url == (
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        )
+        assert provider._api_key == "secret"
+
+
+@pytest.mark.asyncio
+async def test_get_provider_gemini_missing_api_key():
+    """Gemini with empty API key raises HTTPException 503."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="gemini",
+            gemini_api_key="",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_provider()
+
+        assert exc_info.value.status_code == 503
+        assert "GEMINI_API_KEY" in exc_info.value.detail
+        assert "aistudio.google.com" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_provider_groq():
+    """Test that provider_type=groq returns GroqProvider."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="groq",
+            groq_api_key="secret",
+        )
+
+        provider = get_provider()
+
+        assert isinstance(provider, GroqProvider)
+        assert provider._base_url == "https://api.groq.com/openai/v1"
+        assert provider._api_key == "secret"
+
+
+@pytest.mark.asyncio
+async def test_get_provider_groq_missing_api_key():
+    """Groq with empty API key raises HTTPException 503."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="groq",
+            groq_api_key="",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_provider()
+
+        assert exc_info.value.status_code == 503
+        assert "GROQ_API_KEY" in exc_info.value.detail
+        assert "console.groq.com" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_provider_cerebras():
+    """Test that provider_type=cerebras returns CerebrasProvider."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="cerebras",
+            cerebras_api_key="secret",
+        )
+
+        provider = get_provider()
+
+        assert isinstance(provider, CerebrasProvider)
+        assert provider._base_url == "https://api.cerebras.ai/v1"
+        assert provider._api_key == "secret"
+
+
+@pytest.mark.asyncio
+async def test_get_provider_cerebras_missing_api_key():
+    """Cerebras with empty API key raises HTTPException 503."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="cerebras",
+            cerebras_api_key="",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_provider()
+
+        assert exc_info.value.status_code == 503
+        assert "CEREBRAS_API_KEY" in exc_info.value.detail
+        assert "cloud.cerebras.ai" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
 async def test_get_provider_wafer():
     """Test that provider_type=wafer returns WaferProvider."""
     with patch("api.dependencies.get_settings") as mock_settings:
@@ -326,6 +478,40 @@ async def test_get_provider_open_router_missing_api_key():
         assert exc_info.value.status_code == 503
         assert "OPENROUTER_API_KEY" in exc_info.value.detail
         assert "openrouter.ai" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_provider_mistral_missing_api_key():
+    """Mistral with empty API key raises HTTPException 503."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="mistral",
+            mistral_api_key="",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_provider()
+
+        assert exc_info.value.status_code == 503
+        assert "MISTRAL_API_KEY" in exc_info.value.detail
+        assert "console.mistral.ai" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_provider_mistral_codestral_missing_api_key():
+    """Mistral Codestral with empty API key raises HTTPException 503."""
+    with patch("api.dependencies.get_settings") as mock_settings:
+        mock_settings.return_value = _make_mock_settings(
+            provider_type="mistral_codestral",
+            codestral_api_key="",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_provider()
+
+        assert exc_info.value.status_code == 503
+        assert "CODESTRAL_API_KEY" in exc_info.value.detail
+        assert "console.mistral.ai" in exc_info.value.detail
 
 
 @pytest.mark.asyncio

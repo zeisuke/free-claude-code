@@ -44,6 +44,20 @@ def _create_open_router(config: ProviderConfig, _settings: Settings) -> BaseProv
     return OpenRouterProvider(config)
 
 
+def _create_mistral(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.mistral import MistralProvider
+
+    return MistralProvider(config)
+
+
+def _create_mistral_codestral(
+    config: ProviderConfig, _settings: Settings
+) -> BaseProvider:
+    from providers.codestral import CodestralProvider
+
+    return CodestralProvider(config)
+
+
 def _create_deepseek(config: ProviderConfig, _settings: Settings) -> BaseProvider:
     from providers.deepseek import DeepSeekProvider
 
@@ -86,6 +100,42 @@ def _create_opencode(config: ProviderConfig, _settings: Settings) -> BaseProvide
     return OpenCodeProvider(config)
 
 
+def _create_opencode_go(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.opencode import OpenCodeProvider
+
+    return OpenCodeProvider(config, provider_name="OPENCODE_GO")
+
+
+def _create_zai(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.zai import ZaiProvider
+
+    return ZaiProvider(config)
+
+
+def _create_fireworks(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.fireworks import FireworksProvider
+
+    return FireworksProvider(config)
+
+
+def _create_gemini(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.gemini import GeminiProvider
+
+    return GeminiProvider(config)
+
+
+def _create_groq(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.groq import GroqProvider
+
+    return GroqProvider(config)
+
+
+def _create_cerebras(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.cerebras import CerebrasProvider
+
+    return CerebrasProvider(config)
+
+
 def _create_claude_subprocess(config: ProviderConfig, _settings: Settings) -> BaseProvider:
     from providers.claude_subprocess import ClaudeSubprocessProvider
 
@@ -95,13 +145,21 @@ def _create_claude_subprocess(config: ProviderConfig, _settings: Settings) -> Ba
 PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
     "nvidia_nim": _create_nvidia_nim,
     "open_router": _create_open_router,
+    "gemini": _create_gemini,
     "deepseek": _create_deepseek,
+    "mistral": _create_mistral,
+    "mistral_codestral": _create_mistral_codestral,
+    "opencode": _create_opencode,
+    "opencode_go": _create_opencode_go,
+    "wafer": _create_wafer,
+    "kimi": _create_kimi,
+    "cerebras": _create_cerebras,
+    "groq": _create_groq,
+    "fireworks": _create_fireworks,
+    "zai": _create_zai,
     "lmstudio": _create_lmstudio,
     "llamacpp": _create_llamacpp,
     "ollama": _create_ollama,
-    "kimi": _create_kimi,
-    "wafer": _create_wafer,
-    "opencode": _create_opencode,
     "claude_subprocess": _create_claude_subprocess,
 }
 

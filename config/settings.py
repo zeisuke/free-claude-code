@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .constants import HTTP_CONNECT_TIMEOUT_DEFAULT
 from .nim import NimSettings
+from .paths import default_claude_workspace_path, managed_env_path
 from .provider_ids import SUPPORTED_PROVIDER_IDS
 
 
@@ -30,7 +31,7 @@ def _env_files() -> tuple[Path, ...]:
     """Return env file paths in priority order (later overrides earlier)."""
     files: list[Path] = [
         Path(".env"),
-        Path.home() / ".config" / "free-claude-code" / ".env",
+        managed_env_path(),
     ]
     if explicit := os.environ.get("FCC_ENV_FILE"):
         files.append(Path(explicit))
@@ -109,6 +110,12 @@ class Settings(BaseSettings):
     # ==================== OpenRouter Config ====================
     open_router_api_key: str = Field(default="", validation_alias="OPENROUTER_API_KEY")
 
+    # ==================== Mistral La Plateforme ====================
+    mistral_api_key: str = Field(default="", validation_alias="MISTRAL_API_KEY")
+
+    # ==================== Mistral Codestral (codestral.mistral.ai) ====================
+    codestral_api_key: str = Field(default="", validation_alias="CODESTRAL_API_KEY")
+
     # ==================== DeepSeek Config ====================
     deepseek_api_key: str = Field(default="", validation_alias="DEEPSEEK_API_KEY")
 
@@ -118,8 +125,24 @@ class Settings(BaseSettings):
     # ==================== Wafer Config ====================
     wafer_api_key: str = Field(default="", validation_alias="WAFER_API_KEY")
 
-    # ==================== OpenCode Zen Config ====================
+    # ==================== OpenCode Zen / OpenCode Go ====================
+    # Same key from opencode.ai/auth; zen uses prefix ``opencode/``, Go uses ``opencode_go/``.
     opencode_api_key: str = Field(default="", validation_alias="OPENCODE_API_KEY")
+
+    # ==================== Z.ai Config ====================
+    zai_api_key: str = Field(default="", validation_alias="ZAI_API_KEY")
+
+    # ==================== Fireworks AI Config ====================
+    fireworks_api_key: str = Field(default="", validation_alias="FIREWORKS_API_KEY")
+
+    # ==================== Google Gemini (Google AI Studio) ====================
+    gemini_api_key: str = Field(default="", validation_alias="GEMINI_API_KEY")
+
+    # ==================== Groq (OpenAI-compatible) ====================
+    groq_api_key: str = Field(default="", validation_alias="GROQ_API_KEY")
+
+    # ==================== Cerebras Inference (OpenAI-compatible) ====================
+    cerebras_api_key: str = Field(default="", validation_alias="CEREBRAS_API_KEY")
 
     # ==================== Messaging Platform Selection ====================
     # Valid: "telegram" | "discord" | "none"
@@ -192,11 +215,19 @@ class Settings(BaseSettings):
     # ==================== Per-Provider Proxy ====================
     nvidia_nim_proxy: str = Field(default="", validation_alias="NVIDIA_NIM_PROXY")
     open_router_proxy: str = Field(default="", validation_alias="OPENROUTER_PROXY")
+    mistral_proxy: str = Field(default="", validation_alias="MISTRAL_PROXY")
+    codestral_proxy: str = Field(default="", validation_alias="CODESTRAL_PROXY")
     lmstudio_proxy: str = Field(default="", validation_alias="LMSTUDIO_PROXY")
     llamacpp_proxy: str = Field(default="", validation_alias="LLAMACPP_PROXY")
     kimi_proxy: str = Field(default="", validation_alias="KIMI_PROXY")
     wafer_proxy: str = Field(default="", validation_alias="WAFER_PROXY")
     opencode_proxy: str = Field(default="", validation_alias="OPENCODE_PROXY")
+    opencode_go_proxy: str = Field(default="", validation_alias="OPENCODE_GO_PROXY")
+    zai_proxy: str = Field(default="", validation_alias="ZAI_PROXY")
+    fireworks_proxy: str = Field(default="", validation_alias="FIREWORKS_PROXY")
+    gemini_proxy: str = Field(default="", validation_alias="GEMINI_PROXY")
+    groq_proxy: str = Field(default="", validation_alias="GROQ_PROXY")
+    cerebras_proxy: str = Field(default="", validation_alias="CEREBRAS_PROXY")
 
     # ==================== Provider Rate Limiting ====================
     provider_rate_limit: int = Field(default=40, validation_alias="PROVIDER_RATE_LIMIT")
@@ -312,9 +343,7 @@ class Settings(BaseSettings):
     allowed_discord_channels: str | None = Field(
         default=None, validation_alias="ALLOWED_DISCORD_CHANNELS"
     )
-    claude_workspace: str = "./agent_workspace"
     allowed_dir: str = ""
-    claude_cli_bin: str = Field(default="claude", validation_alias="CLAUDE_CLI_BIN")
     max_message_log_entries_per_chat: int | None = Field(
         default=None, validation_alias="MAX_MESSAGE_LOG_ENTRIES_PER_CHAT"
     )
@@ -322,7 +351,6 @@ class Settings(BaseSettings):
     # ==================== Server ====================
     host: str = "0.0.0.0"
     port: int = 8082
-    log_file: str = "server.log"
     # Optional server API key to protect endpoints (Anthropic-style)
     # Set via env `ANTHROPIC_AUTH_TOKEN`. When empty, no auth is required.
     anthropic_auth_token: str = Field(
@@ -363,6 +391,18 @@ class Settings(BaseSettings):
         if v == "" or v is None:
             return None
         return v
+
+    @property
+    def claude_workspace(self) -> str:
+        """Return the fixed Claude data workspace path."""
+
+        return str(default_claude_workspace_path())
+
+    @property
+    def claude_cli_bin(self) -> str:
+        """Return the fixed Claude Code binary name."""
+
+        return "claude"
 
     @field_validator("whisper_device")
     @classmethod

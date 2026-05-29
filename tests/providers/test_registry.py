@@ -5,11 +5,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from config.nim import NimSettings
+from config.provider_catalog import PROVIDER_CATALOG, ZAI_DEFAULT_BASE
 from config.provider_ids import SUPPORTED_PROVIDER_IDS
+from providers.cerebras import CerebrasProvider
+from providers.codestral import CodestralProvider
 from providers.deepseek import DeepSeekProvider
 from providers.exceptions import UnknownProviderTypeError
+from providers.fireworks import FireworksProvider
+from providers.gemini import GeminiProvider
+from providers.groq import GroqProvider
+from providers.kimi import KimiProvider
 from providers.llamacpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
+from providers.mistral import MistralProvider
 from providers.nvidia_nim import NvidiaNimProvider
 from providers.ollama import OllamaProvider
 from providers.open_router import OpenRouterProvider
@@ -17,9 +25,11 @@ from providers.opencode import OpenCodeProvider
 from providers.registry import (
     PROVIDER_DESCRIPTORS,
     ProviderRegistry,
+    build_provider_config,
     create_provider,
 )
 from providers.wafer import WaferProvider
+from providers.zai import ZaiProvider
 
 
 def _make_settings(**overrides):
@@ -28,9 +38,12 @@ def _make_settings(**overrides):
     mock.provider_type = "nvidia_nim"
     mock.nvidia_nim_api_key = "test_key"
     mock.open_router_api_key = "test_openrouter_key"
+    mock.mistral_api_key = "test_mistral_key"
+    mock.codestral_api_key = "test_codestral_key"
     mock.deepseek_api_key = "test_deepseek_key"
     mock.wafer_api_key = "test_wafer_key"
     mock.opencode_api_key = "test_opencode_key"
+    mock.zai_api_key = "test_zai_key"
     mock.lm_studio_base_url = "http://localhost:1234/v1"
     mock.llamacpp_base_url = "http://localhost:8080/v1"
     mock.ollama_base_url = "http://localhost:11434"
@@ -38,9 +51,22 @@ def _make_settings(**overrides):
     mock.open_router_proxy = ""
     mock.lmstudio_proxy = ""
     mock.llamacpp_proxy = ""
+    mock.mistral_proxy = ""
+    mock.codestral_proxy = ""
     mock.kimi_proxy = ""
+    mock.kimi_api_key = "test_kimi_key"
     mock.wafer_proxy = ""
     mock.opencode_proxy = ""
+    mock.opencode_go_proxy = ""
+    mock.zai_proxy = ""
+    mock.fireworks_proxy = ""
+    mock.fireworks_api_key = "test_fireworks_key"
+    mock.gemini_api_key = ""
+    mock.gemini_proxy = ""
+    mock.groq_api_key = ""
+    mock.groq_proxy = ""
+    mock.cerebras_api_key = ""
+    mock.cerebras_proxy = ""
     mock.provider_rate_limit = 40
     mock.provider_rate_window = 60
     mock.provider_max_concurrency = 5
@@ -86,6 +112,50 @@ def test_ollama_descriptor_uses_native_anthropic_transport():
     assert "native_anthropic" in descriptor.capabilities
 
 
+def test_zai_descriptor_uses_fixed_cloud_base_url():
+    descriptor = PROVIDER_DESCRIPTORS["zai"]
+
+    assert descriptor.default_base_url == ZAI_DEFAULT_BASE
+    assert descriptor.base_url_attr is None
+
+
+def test_zai_provider_config_ignores_stale_base_url_setting():
+    descriptor = PROVIDER_DESCRIPTORS["zai"]
+
+    config = build_provider_config(
+        descriptor,
+        _make_settings(zai_base_url="https://custom.zai.invalid/v1"),
+    )
+
+    assert config.base_url == ZAI_DEFAULT_BASE
+
+
+def test_opencode_go_provider_config_uses_correct_base_url_and_name():
+    with patch("httpx.AsyncClient"):
+        provider = create_provider("opencode_go", _make_settings())
+
+    assert isinstance(provider, OpenCodeProvider)
+    assert provider._base_url == "https://opencode.ai/zen/go/v1"
+    assert provider._provider_name == "OPENCODE_GO"
+    assert provider._api_key == "test_opencode_key"
+
+
+def test_opencode_go_catalog_uses_opencode_api_key() -> None:
+    desc = PROVIDER_CATALOG["opencode_go"]
+
+    assert desc.credential_env == "OPENCODE_API_KEY"
+    assert desc.credential_attr == "opencode_api_key"
+
+
+def test_build_provider_config_opencode_go_uses_opencode_api_key() -> None:
+    descriptor = PROVIDER_CATALOG["opencode_go"]
+    settings = _make_settings(opencode_api_key="shared-opencode-token")
+
+    config = build_provider_config(descriptor, settings)
+
+    assert config.api_key == "shared-opencode-token"
+
+
 def test_create_provider_uses_native_openrouter_by_default():
     with patch("httpx.AsyncClient"):
         provider = create_provider("open_router", _make_settings())
@@ -94,15 +164,30 @@ def test_create_provider_uses_native_openrouter_by_default():
 
 
 def test_create_provider_instantiates_each_builtin():
-    settings = _make_settings()
+    settings = _make_settings(
+        gemini_api_key="test_gemini_key",
+        groq_api_key="test_groq_key",
+        cerebras_api_key="test_cerebras_key",
+        fireworks_api_key="test_fireworks_key",
+        kimi_api_key="test_kimi_key",
+    )
     cases = {
         "nvidia_nim": NvidiaNimProvider,
+        "mistral": MistralProvider,
+        "mistral_codestral": CodestralProvider,
         "deepseek": DeepSeekProvider,
+        "kimi": KimiProvider,
+        "fireworks": FireworksProvider,
         "lmstudio": LMStudioProvider,
         "llamacpp": LlamaCppProvider,
         "ollama": OllamaProvider,
         "wafer": WaferProvider,
         "opencode": OpenCodeProvider,
+        "opencode_go": OpenCodeProvider,
+        "zai": ZaiProvider,
+        "gemini": GeminiProvider,
+        "groq": GroqProvider,
+        "cerebras": CerebrasProvider,
     }
 
     with (
