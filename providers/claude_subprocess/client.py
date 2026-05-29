@@ -31,9 +31,9 @@ _CLAUDE_MODEL_MAP: dict[str, str] = {
 }
 
 _OLLAMA_MODEL_MAP: dict[str, str] = {
-    "haiku": "qwen2.5:0.5b",
-    "sonnet": "gemma4:latest",
-    "opus": "gemma4:latest",
+    "haiku": "llama3.1:8b",
+    "sonnet": "llama3.1:8b",
+    "opus": "llama3.1:8b",
 }
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
@@ -288,8 +288,8 @@ class ClaudeSubprocessProvider(BaseProvider):
             yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
             return
 
-        # No images — use standard OllamaProvider with text-only request
-        ollama_request = request.model_copy(update={"model": ollama_model})
+        # Strip tools from Ollama request — Ollama's /v1/messages doesn't support hermes tool schemas.
+        ollama_request = request.model_copy(update={"model": ollama_model, "tools": None})
         config = ProviderConfig(api_key="ollama", base_url="http://localhost:11434", max_concurrency=5)
         provider = OllamaProvider(config)
         try:
