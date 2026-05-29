@@ -78,7 +78,7 @@ class ClaudeSubprocessProvider(BaseProvider):
         thinking_enabled: bool | None = None,
     ) -> AsyncIterator[str]:
         if await _is_fcc_active():
-            logger.info("claude_subprocess: FCC active — routing directly to Ollama")
+            logger.info("claude_subprocess: FCC active — routing to Ollama")
             async for chunk in self._ollama_stream(request, input_tokens, request_id=request_id):
                 yield chunk
             return
@@ -193,8 +193,74 @@ class ClaudeSubprocessProvider(BaseProvider):
         self, request: Any, input_tokens: int, *, request_id: str | None = None
     ) -> AsyncIterator[str]:
         from providers.ollama import OllamaProvider
+        import json as _json_o, uuid as _uuid_o
 
         ollama_model = _resolve_ollama_model(request.model)
+
+        # Check for image blocks — route to moondream via Ollama /api/chat (supports vision).
+        # Standard OllamaProvider uses /v1/messages which does NOT support image blocks.
+        def _extract_images_and_text(msgs):
+            """Return (ollama_chat_messages, has_images) for Ollama /api/chat format."""
+            out, has_imgs = [], False
+            for msg in (msgs or []):
+                role = str(getattr(msg, "role", "user"))
+                content = msg.content
+                texts, imgs = [], []
+                if isinstance(content, list):
+                    for block in content:
+                        btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                        if btype == "text":
+                            texts.append(getattr(block, "text", "") or block.get("text", ""))
+                        elif btype == "image":
+                            source = getattr(block, "source", None) or (block.get("source") if isinstance(block, dict) else None)
+                            data = getattr(source, "data", None) or (source.get("data") if isinstance(source, dict) else None)
+                            if data:
+                                imgs.append(data)
+                        elif btype == "image_url":
+                            iu = getattr(block, "image_url", None) or (block.get("image_url") if isinstance(block, dict) else None)
+                            url = getattr(iu, "url", "") or (iu.get("url", "") if isinstance(iu, dict) else "")
+                            if url.startswith("data:"):
+                                _, _, d = url.partition(",")
+                                imgs.append(d)
+                elif isinstance(content, str):
+                    texts.append(content)
+                entry: dict = {"role": role, "content": " ".join(texts)}
+                if imgs:
+                    entry["images"] = imgs
+                    has_imgs = True
+                out.append(entry)
+            return out, has_imgs
+
+        chat_messages, has_images = _extract_images_and_text(request.messages)
+
+        if has_images:
+            # Use moondream via Ollama /api/chat for vision (supports image blocks natively)
+            import urllib.request as _ur_v, json as _j_v, uuid as _uid_v
+            system_text = _extract_system_text(request.system)
+            if system_text:
+                chat_messages = [{"role": "system", "content": system_text}] + chat_messages
+            body = _j_v.dumps({"model": "moondream:latest", "messages": chat_messages, "stream": False}).encode()
+            req_v = _ur_v.Request("http://localhost:11434/api/chat", data=body,
+                                  headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                loop = asyncio.get_event_loop()
+                resp = await loop.run_in_executor(None, lambda: _j_v.loads(_ur_v.urlopen(req_v, timeout=60).read()))
+                text = resp.get("message", {}).get("content", "")
+                logger.info("claude_subprocess: moondream vision response len=%d", len(text))
+            except Exception as _ve:
+                logger.warning("moondream vision failed: %s", _ve)
+                text = ""
+            mid = f"msg_{_uid_v.uuid4().hex[:24]}"
+            yield f"event: message_start\ndata: " + _j_v.dumps({"type":"message_start","message":{"id":mid,"type":"message","role":"assistant","content":[],"model":request.model,"stop_reason":None,"usage":{"input_tokens":input_tokens,"output_tokens":0}}}) + "\n\n"
+            if text:
+                yield "event: content_block_start\ndata: " + _j_v.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
+                yield "event: content_block_delta\ndata: " + _j_v.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}) + "\n\n"
+                yield "event: content_block_stop\ndata: " + _j_v.dumps({"type":"content_block_stop","index":0}) + "\n\n"
+            yield "event: message_delta\ndata: " + _j_v.dumps({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":None},"usage":{"output_tokens":0}}) + "\n\n"
+            yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+            return
+
+        # No images — use standard OllamaProvider with text-only request
         ollama_request = request.model_copy(update={"model": ollama_model})
         config = ProviderConfig(api_key="ollama", base_url="http://localhost:11434", max_concurrency=5)
         provider = OllamaProvider(config)
