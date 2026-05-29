@@ -135,6 +135,12 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         proxy_attr="opencode_proxy",
         capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
     ),
+    "claude_subprocess": ProviderDescriptor(
+        provider_id="claude_subprocess",
+        transport_type="anthropic_messages",
+        static_credential="claude",
+        capabilities=("chat", "streaming", "tools", "local"),
+    ),
 }
 
 # Order matches docs / historical error text; must match PROVIDER_CATALOG keys.

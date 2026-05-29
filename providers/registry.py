@@ -86,6 +86,12 @@ def _create_opencode(config: ProviderConfig, _settings: Settings) -> BaseProvide
     return OpenCodeProvider(config)
 
 
+def _create_claude_subprocess(config: ProviderConfig, _settings: Settings) -> BaseProvider:
+    from providers.claude_subprocess import ClaudeSubprocessProvider
+
+    return ClaudeSubprocessProvider(config)
+
+
 PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
     "nvidia_nim": _create_nvidia_nim,
     "open_router": _create_open_router,
@@ -96,6 +102,7 @@ PROVIDER_FACTORIES: dict[str, ProviderFactory] = {
     "kimi": _create_kimi,
     "wafer": _create_wafer,
     "opencode": _create_opencode,
+    "claude_subprocess": _create_claude_subprocess,
 }
 
 if set(PROVIDER_DESCRIPTORS) != set(SUPPORTED_PROVIDER_IDS) or set(
