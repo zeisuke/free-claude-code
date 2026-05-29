@@ -94,7 +94,12 @@ class ClaudeSubprocessProvider(BaseProvider):
 
     async def _subprocess_stream(self, request: Any, input_tokens: int) -> AsyncIterator[str]:
         system_text = _extract_system_text(request.system)
-        if request.tools:
+        # Check for web tools before injecting XML tool definitions
+        _web_tool_names = {t.name for t in (request.tools or [])} if request.tools else set()
+        _has_web_tools = bool(_web_tool_names & {"web_search", "web_extract"})
+
+        if request.tools and not _has_web_tools:
+            # Inject hermes tool definitions as XML (for non-web tools like kanban, memory, etc.)
             tools_json = json.dumps(
                 [t.model_dump(exclude_none=True) for t in request.tools], indent=2
             )
@@ -105,6 +110,12 @@ class ClaudeSubprocessProvider(BaseProvider):
                 "When calling a tool, emit exactly:\n"
                 "<tool_call>{\"name\":\"TOOL_NAME\",\"input\":{...}}</tool_call>\n"
                 "You may emit multiple tool calls. Add explanatory text outside the tags."
+            )
+        elif _has_web_tools:
+            # Skip XML injection — use native WebSearch/WebFetch instead
+            system_text = (system_text or "") + (
+                "\n\nWEB SEARCH AVAILABLE: Use the native WebSearch tool to find real-time information. "
+                "Do NOT say you cannot access the internet. Just search."
             )
 
         prompt, image_paths = _build_conversation_text(request.messages)
@@ -127,6 +138,8 @@ class ClaudeSubprocessProvider(BaseProvider):
             "--output-format", "text",
             "--max-turns", "10",
         ]
+        if _has_web_tools:
+            cmd += ["--allowed-tools", "WebSearch,WebFetch"]
         if final_system:
             cmd += ["--system-prompt", final_system]
         # Add image directories so claude -p can read [image: path] references via Read tool
@@ -147,10 +160,25 @@ class ClaudeSubprocessProvider(BaseProvider):
             stdout=PIPE,
             stderr=PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_SUBPROCESS_TIMEOUT)
 
+        # Send SSE keepalive pings every 5s while waiting for subprocess.
+        # Without this, hermes's 60s stream-stale threshold kills the connection
+        # before claude_subprocess finishes (especially with WebSearch which can take 30-90s).
+        communicate_task = asyncio.ensure_future(proc.communicate())
+        elapsed = 0
+        while not communicate_task.done():
+            done, _ = await asyncio.wait({communicate_task}, timeout=5.0)
+            if not done:
+                yield ": keepalive\n\n"
+                elapsed += 5
+                if elapsed >= _SUBPROCESS_TIMEOUT:
+                    communicate_task.cancel()
+                    raise RuntimeError(f"claude subprocess timeout after {_SUBPROCESS_TIMEOUT}s")
+
+        stdout_bytes, stderr_bytes = communicate_task.result()
         if proc.returncode != 0:
-            raise RuntimeError(f"claude exit {proc.returncode}: {stderr.decode()[:300]}")
+            raise RuntimeError(f"claude exit {proc.returncode}: {stderr_bytes.decode()[:300]}")
+        stdout = stdout_bytes
 
         text = stdout.decode()
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
