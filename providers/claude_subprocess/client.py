@@ -1,11 +1,11 @@
 """Claude subprocess provider.
 
-Spawns 'claude -p' for real Claude responses (Claude Code subscription auth).
-Falls back to Ollama on any subprocess failure.
+Spawns 'claude -p --output-format stream-json' for real Claude responses using
+Claude Code subscription auth. The agent loop (tool calls, WebSearch, Read, Bash)
+runs inside the subprocess; FCC waits for the final 'result' event and returns
+it as a single Anthropic SSE text block.
 
-Tool definitions are injected into the system prompt as XML+JSON; tool calls are
-parsed from the response via <tool_call>{...}</tool_call> tags and converted to
-proper Anthropic tool_use SSE blocks so hermes's AIAgent can execute them.
+Falls back to Ollama on any subprocess failure.
 """
 
 from __future__ import annotations
@@ -94,76 +94,71 @@ class ClaudeSubprocessProvider(BaseProvider):
 
     async def _subprocess_stream(self, request: Any, input_tokens: int) -> AsyncIterator[str]:
         system_text = _extract_system_text(request.system)
-        # Check for web tools before injecting XML tool definitions
-        _web_tool_names = {t.name for t in (request.tools or [])} if request.tools else set()
-        _has_web_tools = bool(_web_tool_names & {"web_search", "web_extract"})
-
-        if request.tools and not _has_web_tools:
-            # Inject hermes tool definitions as XML (for non-web tools like kanban, memory, etc.)
-            tools_json = json.dumps(
-                [t.model_dump(exclude_none=True) for t in request.tools], indent=2
-            )
-            system_text = (system_text or "") + (
-                "\n\n<tools>\n"
-                + tools_json
-                + "\n</tools>\n"
-                "When calling a tool, emit exactly:\n"
-                "<tool_call>{\"name\":\"TOOL_NAME\",\"input\":{...}}</tool_call>\n"
-                "You may emit multiple tool calls. Add explanatory text outside the tags."
-            )
-        elif _has_web_tools:
-            # Skip XML injection — use native WebSearch/WebFetch instead
-            system_text = (system_text or "") + (
-                "\n\nWEB SEARCH AVAILABLE: Use the native WebSearch tool to find real-time information. "
-                "Do NOT say you cannot access the internet. Just search."
-            )
-
         prompt, image_paths = _build_conversation_text(request.messages)
         claude_model = _resolve_claude_model(request.model)
 
-        # Build system prompt: append image instruction when images are present
         final_system = system_text or ""
         if image_paths:
-            img_instr = (
-                "IMAGE INSTRUCTION: This message contains [image: /path] reference(s). "
-                "Use the Read tool to load and view each image file, then respond based on what you see."
-            )
-            final_system = (final_system + "\n\n" + img_instr).strip()
+            final_system = (
+                final_system
+                + "\n\nIMAGE INSTRUCTION: image files are available in the added directories. "
+                "Use the Read tool to load and view them before responding."
+            ).strip()
+
+        # --output-format json: claude -p runs the full agent loop (WebSearch, Read, Bash)
+        # internally and returns a single JSON result when done. No XML injection needed;
+        # --allowed-tools passes native Claude Code tools directly.
+        #
+        # cwd must be a neutral directory with no .claude/settings.json to avoid loading
+        # SessionStart hooks (which connect to Hermes KB and MCP servers, adding 20-30s).
+        _fcc_cwd = "/tmp/hermes_fcc"
+        os.makedirs(_fcc_cwd, exist_ok=True)
 
         cmd = [
             "claude", "-p",
             "--model", claude_model,
             "--dangerously-skip-permissions",
             "--no-session-persistence",
-            "--output-format", "text",
-            "--max-turns", "10",
+            "--output-format", "json",
+            "--max-turns", "5",
+            "--allowed-tools", "WebSearch,WebFetch,Read",
         ]
-        if _has_web_tools:
-            cmd += ["--allowed-tools", "WebSearch,WebFetch"]
         if final_system:
             cmd += ["--system-prompt", final_system]
-        # Add image directories so claude -p can read [image: path] references via Read tool
         seen_dirs: set[str] = set()
         for img_path in image_paths:
             img_dir = os.path.dirname(img_path)
             if img_dir and img_dir not in seen_dirs:
                 cmd += ["--add-dir", img_dir]
                 seen_dirs.add(img_dir)
-        if image_paths:
-            cmd.append("--")  # separate variadic --add-dir dirs from the prompt argument
         cmd.append(prompt)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=_clean_env(),
-            stdin=asyncio.subprocess.DEVNULL,  # prevent 3s stdin wait in daemon
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=PIPE,
             stderr=PIPE,
+            cwd=_fcc_cwd,
         )
 
-        # Send SSE keepalive pings every 5s while waiting for subprocess.
-        # Without this, hermes's 60s stream-stale threshold kills the connection
-        # before claude_subprocess finishes (especially with WebSearch which can take 30-90s).
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        yield (
+            "event: message_start\ndata: "
+            + json.dumps({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "content": [], "model": request.model,
+                    "stop_reason": None,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                },
+            })
+            + "\n\n"
+        )
+
+        # claude -p --output-format json blocks until the full agent loop completes,
+        # then writes a single JSON object. Yield keepalives every 5s while waiting.
         communicate_task = asyncio.ensure_future(proc.communicate())
         elapsed = 0
         while not communicate_task.done():
@@ -178,43 +173,43 @@ class ClaudeSubprocessProvider(BaseProvider):
         stdout_bytes, stderr_bytes = communicate_task.result()
         if proc.returncode != 0:
             raise RuntimeError(f"claude exit {proc.returncode}: {stderr_bytes.decode()[:300]}")
-        stdout = stdout_bytes
 
-        text = stdout.decode()
-        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-        parts = _parse_content(text)
-        has_tool_use = any(p["type"] == "tool_use" for p in parts)
+        try:
+            result_obj = json.loads(stdout_bytes.decode())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"claude json parse error: {exc}") from exc
+
+        # Extract final text from result object
+        result_text = result_obj.get("result", "")
+        if not result_text and result_obj.get("is_error"):
+            raise RuntimeError(f"claude error result: {result_obj.get('subtype','unknown')}")
+        if not result_text:
+            raise RuntimeError("claude subprocess: empty result")
 
         yield (
-            f"event: message_start\ndata: "
-            + json.dumps({
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": request.model,
-                    "stop_reason": None,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-                },
-            })
+            "event: content_block_start\ndata: "
+            + json.dumps({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "text", "text": ""}})
             + "\n\n"
         )
-
-        for idx, part in enumerate(parts):
-            if part["type"] == "text" and part["text"]:
-                yield f"event: content_block_start\ndata: " + json.dumps({"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}}) + "\n\n"
-                yield f"event: content_block_delta\ndata: " + json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": part["text"]}}) + "\n\n"
-                yield f"event: content_block_stop\ndata: " + json.dumps({"type": "content_block_stop", "index": idx}) + "\n\n"
-            elif part["type"] == "tool_use":
-                tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                yield f"event: content_block_start\ndata: " + json.dumps({"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": tool_id, "name": part["name"], "input": {}}}) + "\n\n"
-                yield f"event: content_block_delta\ndata: " + json.dumps({"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(part["input"])}}) + "\n\n"
-                yield f"event: content_block_stop\ndata: " + json.dumps({"type": "content_block_stop", "index": idx}) + "\n\n"
-
-        stop_reason = "tool_use" if has_tool_use else "end_turn"
-        yield f"event: message_delta\ndata: " + json.dumps({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 0}}) + "\n\n"
+        yield (
+            "event: content_block_delta\ndata: "
+            + json.dumps({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "text_delta", "text": result_text}})
+            + "\n\n"
+        )
+        yield (
+            "event: content_block_stop\ndata: "
+            + json.dumps({"type": "content_block_stop", "index": 0})
+            + "\n\n"
+        )
+        yield (
+            "event: message_delta\ndata: "
+            + json.dumps({"type": "message_delta",
+                          "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                          "usage": {"output_tokens": 0}})
+            + "\n\n"
+        )
         yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
     async def _ollama_stream(
