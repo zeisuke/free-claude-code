@@ -195,4 +195,3 @@ async def stream_with_pool(
             yield chunk
         return
 
-    raise ServiceUnavailableError("all pool models exhausted")

@@ -20,7 +20,7 @@ _OLLAMA_TIMEOUT = 120.0
 
 
 async def analyze_image_ollama(image_path: Path, prompt: str) -> str:
-    """Describe an image via Ollama gemma4 vision. Returns plain-text description."""
+    """Describe an image via Ollama moondream vision. Returns plain-text description."""
     import httpx
 
     data = image_path.read_bytes()

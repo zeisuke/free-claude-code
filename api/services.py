@@ -241,6 +241,26 @@ async def _pool_stream(
             yield chunk
         return
 
+    # All pool models failed/cooling. Bypass pool: route directly through
+    # claude_subprocess provider which has _is_fcc_active() → Ollama logic:
+    #   FCC active   → Ollama (llama3.1:8b text / moondream vision)
+    #   FCC inactive → claude -p → Ollama fallback on subprocess failure
+    logger.warning(
+        "CB: all pool models failed — bypassing pool, routing via claude_subprocess"
+    )
+    try:
+        bypass_provider = provider_getter("claude_subprocess")
+        raw_model = settings.model
+        bypass_model = Settings.parse_model_name(raw_model) if "/" in raw_model else raw_model
+        bypass_request = base_request.model_copy(update={"model": bypass_model}, deep=True)
+        async for chunk in bypass_provider.stream_response(
+            bypass_request, input_tokens=input_tokens, request_id=request_id
+        ):
+            yield chunk
+        return
+    except Exception as bypass_exc:
+        logger.error("CB: claude_subprocess bypass failed: {}", bypass_exc)
+
     # all models failed — emit the last error or a generic one
     yield last_err_chunk or _ALL_FAILED_SSE
 
