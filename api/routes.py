@@ -179,6 +179,11 @@ async def create_message(
 ):
     """Create a message — streaming by default, JSON for stream=false."""
     response = service.create_message(request_data)
+    # Optimization handlers return MessagesResponse directly — return as JSON immediately.
+    from api.models.responses import MessagesResponse as _MR
+    if isinstance(response, _MR):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=response.model_dump())
     if request_data.stream is not True:  # None (omitted) or False → non-streaming JSON
         from api.services import _accumulate_sse_to_json
         # StreamingResponse wraps the async generator; extract it for accumulation

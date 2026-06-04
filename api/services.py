@@ -52,6 +52,10 @@ async def _accumulate_sse_to_json(stream: AsyncIterator[str]):
     model = None
     stop_reason = "end_turn"
     text_parts: list[str] = []
+    # tool_use block tracking: index → {id, name, args_parts}
+    tool_blocks: dict[int, dict] = {}
+    current_block_idx: int | None = None
+    current_block_type: str = ""
     input_tokens = 0
     output_tokens = 0
 
@@ -75,21 +79,57 @@ async def _accumulate_sse_to_json(stream: AsyncIterator[str]):
                 model = msg.get("model")
                 usage = msg.get("usage", {})
                 input_tokens = usage.get("input_tokens", 0)
+            elif t == "content_block_start":
+                idx = ev.get("index", 0)
+                cb = ev.get("content_block", {})
+                current_block_idx = idx
+                current_block_type = cb.get("type", "")
+                if current_block_type == "tool_use":
+                    tool_blocks[idx] = {
+                        "id": cb.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                        "name": cb.get("name", ""),
+                        "args_parts": [],
+                    }
             elif t == "content_block_delta":
                 delta = ev.get("delta", {})
-                if delta.get("type") == "text_delta":
+                idx = ev.get("index", current_block_idx)
+                dtype = delta.get("type", "")
+                if dtype == "text_delta":
                     text_parts.append(delta.get("text", ""))
+                elif dtype == "input_json_delta" and idx in tool_blocks:
+                    tool_blocks[idx]["args_parts"].append(delta.get("partial_json", ""))
             elif t == "message_delta":
                 delta = ev.get("delta", {})
                 stop_reason = delta.get("stop_reason", stop_reason)
                 usage = ev.get("usage", {})
                 output_tokens = usage.get("output_tokens", 0)
 
+    # Build content array: text block + tool_use blocks
+    content: list[dict] = []
+    text = "".join(text_parts)
+    if text:
+        content.append({"type": "text", "text": text})
+    for idx in sorted(tool_blocks.keys()):
+        tb = tool_blocks[idx]
+        args_str = "".join(tb["args_parts"])
+        try:
+            args_input = _json.loads(args_str) if args_str else {}
+        except Exception:
+            args_input = {}
+        content.append({
+            "type": "tool_use",
+            "id": tb["id"],
+            "name": tb["name"],
+            "input": args_input,
+        })
+    if not content:
+        content.append({"type": "text", "text": ""})
+
     body = {
         "id": msg_id or f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": "".join(text_parts)}],
+        "content": content,
         "model": model or "unknown",
         "stop_reason": stop_reason,
         "stop_sequence": None,

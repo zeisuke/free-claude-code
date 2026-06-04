@@ -31,12 +31,15 @@ _CLAUDE_MODEL_MAP: dict[str, str] = {
 }
 
 _OLLAMA_MODEL_MAP: dict[str, str] = {
-    "haiku": "llama3.1:8b",
-    "sonnet": "llama3.1:8b",
-    "opus": "llama3.1:8b",
+    "haiku": "qwen3.5:9b",
+    "sonnet": "qwen3.5:9b",
+    "opus": "qwen3.5:9b",
 }
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+# Matches <tool_call>...</tool_call> and malformed variants like /tool_call>{...}
+_TOOL_CALL_RE = re.compile(
+    r"(?:<|/)tool_call>?\s*(.*?)\s*(?:</tool_call>|$)", re.DOTALL
+)
 
 _SUBPROCESS_TIMEOUT = 120  # seconds
 
@@ -254,44 +257,351 @@ class ClaudeSubprocessProvider(BaseProvider):
                 out.append(entry)
             return out, has_imgs
 
-        chat_messages, has_images = _extract_images_and_text(request.messages)
+        # qwen3.5:9b supports native vision + tools — no moondream routing needed.
+        import urllib.request as _ur_t, json as _j_t, uuid as _uid_t
 
-        if has_images:
-            # Use moondream via Ollama /api/chat for vision (supports image blocks natively)
-            import urllib.request as _ur_v, json as _j_v, uuid as _uid_v
-            system_text = _extract_system_text(request.system)
-            if system_text:
-                chat_messages = [{"role": "system", "content": system_text}] + chat_messages
-            body = _j_v.dumps({"model": "moondream:latest", "messages": chat_messages, "stream": False}).encode()
-            req_v = _ur_v.Request("http://localhost:11434/api/chat", data=body,
-                                  headers={"Content-Type": "application/json"}, method="POST")
+        # 0. Compress claude -p built-in system prompt (38K+ tokens → ≤12K chars ~3K tokens).
+        #    Compress, NOT replace — keep tool descriptions and core behavior rules.
+        #    Strategy: keep first _SYS_KEEP_CHARS chars (contains role + tools) + Jarvis addendum.
+        _CLAUDE_CODE_MARKERS = (
+            "Claude Code", "claude code", "CLAUDE CODE",
+            "agentic coding", "software engineering tasks",
+            "tool_use_id", "bash_20250124", "computer_use",
+        )
+        _SYS_KEEP_CHARS = 6000   # ~1.5K tokens: role + key tools, leaves room for messages + KV cache
+        raw_system = _extract_system_text(request.system)
+        _is_claude_code_prompt = any(m in raw_system for m in _CLAUDE_CODE_MARKERS)
+        if _is_claude_code_prompt:
+            # Compress: keep tool/capability descriptions from middle of prompt,
+            # but OVERRIDE the identity section with Jarvis to prevent role confusion.
+            # Identity override MUST come first so the model reads it before the tools.
+            _identity = (
+                "You are Jarvis, a concise personal AI assistant. "
+                "Be direct and complete tasks immediately. "
+                "Respond in the same language as the user.\n\n"
+            )
+            if len(raw_system) > _SYS_KEEP_CHARS:
+                # Keep tool descriptions from the middle of the prompt (skip first 2K identity chars)
+                _tool_section = raw_system[2000:_SYS_KEEP_CHARS + 2000].strip()
+                _effective_system = _identity + _tool_section
+            else:
+                _effective_system = _identity + raw_system
+            logger.info(
+                "claude_subprocess: compressed system prompt %d→%d chars",
+                len(raw_system), len(_effective_system),
+            )
+        else:
+            _effective_system = raw_system or "You are Jarvis, a concise personal AI assistant. Be direct."
+
+        # 0.1 Compress conversation history if too large for local model context.
+        #     - Keep recent KEEP_TURNS messages in full (recent tool results matter most)
+        #     - Compress older messages → readable 1-line summaries
+        #     - Archive full content → Hindsight bank for on-demand retrieval
+        #     Reduces hallucination vs silent truncation: model knows what was compressed.
+        _CTX_TOKEN_LIMIT = 20000   # target max tokens for messages (~80K chars)
+        _KEEP_TURNS = 6            # keep last 6 messages (≈3 tool call rounds) in full
+        _SUMMARY_CHARS = 200       # max chars per compressed message summary
+
+        def _get_field(m, key, default=""):
+            """Get a field from either a pydantic object or a dict."""
+            if isinstance(m, dict):
+                return m.get(key, default)
+            return getattr(m, key, default)
+
+        def _estimate_tokens(msgs):
+            return sum(len(str(_get_field(m, "content", ""))) for m in msgs) // 4
+
+        def _msg_summary(msg):
+            role = _get_field(msg, "role", "?")
+            content = str(_get_field(msg, "content", ""))
+            preview = content.replace("\n", " ")[:_SUMMARY_CHARS]
+            if len(content) > _SUMMARY_CHARS:
+                preview += "…"
+            return f"[{role}]: {preview}"
+
+        _msgs = list(request.messages or [])
+        if _estimate_tokens(_msgs) > _CTX_TOKEN_LIMIT and len(_msgs) > _KEEP_TURNS:
+            _to_archive = _msgs[:-_KEEP_TURNS]
+            _to_keep   = _msgs[-_KEEP_TURNS:]
+
+            # Build readable summary of archived messages
+            _archive_lines = [_msg_summary(m) for m in _to_archive]
+            _archive_text  = "\n".join(_archive_lines)
+
+            # Archive full content to KB (search_api /kb/store) for reliable retrieval.
+            # Uses Hermes-KB-Token from keychain — same path used by all KB writes.
+            _retrieval_hint = "Earlier context compressed. Use search_kb or hindsight_recall to retrieve if needed."
             try:
-                loop = asyncio.get_event_loop()
-                resp = await loop.run_in_executor(None, lambda: _j_v.loads(_ur_v.urlopen(req_v, timeout=60).read()))
-                text = resp.get("message", {}).get("content", "")
-                logger.info("claude_subprocess: moondream vision response len=%d", len(text))
-            except Exception as _ve:
-                logger.warning("moondream vision failed: %s", _ve)
-                text = ""
-            mid = f"msg_{_uid_v.uuid4().hex[:24]}"
-            yield f"event: message_start\ndata: " + _j_v.dumps({"type":"message_start","message":{"id":mid,"type":"message","role":"assistant","content":[],"model":request.model,"stop_reason":None,"usage":{"input_tokens":input_tokens,"output_tokens":0}}}) + "\n\n"
-            if text:
-                yield "event: content_block_start\ndata: " + _j_v.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
-                yield "event: content_block_delta\ndata: " + _j_v.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}) + "\n\n"
-                yield "event: content_block_stop\ndata: " + _j_v.dumps({"type":"content_block_stop","index":0}) + "\n\n"
-            yield "event: message_delta\ndata: " + _j_v.dumps({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":None},"usage":{"output_tokens":0}}) + "\n\n"
-            yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-            return
+                import subprocess as _sp
+                # Run blocking calls in executor to avoid blocking asyncio event loop
+                def _archive_to_kb():
+                    _kb_token = _sp.check_output(
+                        ["security", "find-generic-password", "-s", "Hermes-KB-Token", "-w"],
+                        stderr=_sp.DEVNULL,
+                    ).decode().strip()
+                    _kb_body = _j_t.dumps({
+                        "content": f"[FCC session context archive — request_id: {request_id}]\n{_archive_text}",
+                        "content_type": "fcc_session",
+                        "metadata": {
+                            "source": "fcc_compress",
+                            "request_id": request_id or "unknown",
+                            "archived_turns": len(_to_archive),
+                        },
+                    }).encode()
+                    _kb_req = _ur_t.Request(
+                        "http://localhost:8765/kb/store",
+                        data=_kb_body,
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {_kb_token}"},
+                    )
+                    return _j_t.loads(_ur_t.urlopen(_kb_req, timeout=5).read())
+                _kb_resp = await asyncio.get_event_loop().run_in_executor(None, _archive_to_kb)
+                _kb_id = _kb_resp.get("id", "?")
+                _retrieval_hint = (
+                    f"Earlier context archived to KB (id={_kb_id}). "
+                    "Use search_kb or hindsight_recall to retrieve if needed."
+                )
+                logger.info("claude_subprocess: archived %d msgs to KB id=%s", len(_to_archive), _kb_id)
+            except Exception as _ae:
+                logger.warning("claude_subprocess: KB archive failed: %s", _ae)
 
-        # Strip tools from Ollama request — Ollama's /v1/messages doesn't support hermes tool schemas.
-        ollama_request = request.model_copy(update={"model": ollama_model, "tools": None})
-        config = ProviderConfig(api_key="ollama", base_url="http://localhost:11434", max_concurrency=5)
-        provider = OllamaProvider(config)
+            # Replace old messages with compressed summary + retrieval hint
+            _summary_msg = {
+                "role": "user",
+                "content": (
+                    f"[Earlier conversation compressed — {len(_to_archive)} messages archived]\n"
+                    f"{_archive_text}\n\n"
+                    f"{_retrieval_hint}"
+                ),
+            }
+            _msgs = [_summary_msg] + _to_keep
+            logger.info(
+                "claude_subprocess: compressed %d→%d messages (est %d tokens saved)",
+                len(_to_archive) + _KEEP_TURNS,
+                len(_msgs),
+                _estimate_tokens(_to_archive),
+            )
+
+        # 1. Convert tools: Anthropic → OpenAI function calling format (qwen3.5 native)
+        ollama_tools = None
+        if request.tools:
+            ollama_tools = []
+            for t in request.tools:
+                name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else "")
+                desc = getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")
+                schema = (getattr(t, "input_schema", None) or
+                          (t.get("input_schema") if isinstance(t, dict) else None) or {})
+                if name:
+                    ollama_tools.append({
+                        "type": "function",
+                        "function": {"name": name, "description": desc, "parameters": schema},
+                    })
+
+        # 2. Build /api/chat messages with native vision + tool support.
+        #    Anthropic format → Ollama /api/chat format:
+        #      image blocks      → "images" list (base64)
+        #      tool_use blocks   → assistant message with tool_calls
+        #      tool_result block → role=tool message
+        def _convert_block_list(role, blocks):
+            """Convert Anthropic content block list to ≥1 Ollama messages."""
+            texts, images, tool_calls_blk, tool_results = [], [], [], []
+            for block in blocks:
+                btype = (getattr(block, "type", None) or
+                         (block.get("type") if isinstance(block, dict) else None))
+                if btype == "text":
+                    texts.append(getattr(block, "text", "") or block.get("text", ""))
+                elif btype in ("image", "image_url"):
+                    # Extract base64 data
+                    if btype == "image":
+                        src = getattr(block, "source", None) or block.get("source", {})
+                        data = getattr(src, "data", None) or (src.get("data") if isinstance(src, dict) else None)
+                    else:
+                        iu = getattr(block, "image_url", None) or block.get("image_url", {})
+                        url = getattr(iu, "url", "") or (iu.get("url", "") if isinstance(iu, dict) else "")
+                        _, _, data = url.partition(",") if url.startswith("data:") else ("", "", "")
+                    if data:
+                        images.append(data)
+                elif btype == "tool_use":
+                    tid = getattr(block, "id", None) or block.get("id", f"call_{_uid_t.uuid4().hex[:8]}")
+                    name = getattr(block, "name", "") or block.get("name", "")
+                    inp = getattr(block, "input", {}) or block.get("input", {})
+                    # Ollama /api/chat expects arguments as dict (not JSON string like OpenAI)
+                    if isinstance(inp, str):
+                        try:
+                            inp = _j_t.loads(inp)
+                        except Exception:
+                            inp = {"_raw": inp}
+                    tool_calls_blk.append({
+                        "id": tid, "type": "function",
+                        "function": {"name": name, "arguments": inp},
+                    })
+                elif btype == "tool_result":
+                    tid = getattr(block, "tool_use_id", None) or block.get("tool_use_id", "")
+                    rc = getattr(block, "content", "") or block.get("content", "")
+                    if isinstance(rc, list):
+                        rc = " ".join(
+                            (getattr(p, "text", "") or p.get("text", ""))
+                            for p in rc if hasattr(p, "text") or isinstance(p, dict)
+                        )
+                    tool_results.append({"role": "tool", "tool_call_id": tid, "content": str(rc)})
+
+            out = []
+            if tool_results:
+                out.extend(tool_results)
+            elif tool_calls_blk:
+                msg: dict = {"role": "assistant", "tool_calls": tool_calls_blk}
+                if texts:
+                    msg["content"] = " ".join(texts)
+                out.append(msg)
+            else:
+                entry: dict = {"role": role, "content": " ".join(texts)}
+                if images:
+                    entry["images"] = images
+                out.append(entry)
+            return out
+
+        ollama_messages = []
+        if _effective_system:
+            ollama_messages.append({"role": "system", "content": _effective_system})
+        for msg in _msgs:
+            role = str(getattr(msg, "role", "user"))
+            content = msg.content
+            if isinstance(content, list):
+                ollama_messages.extend(_convert_block_list(role, content))
+            elif isinstance(content, str):
+                ollama_messages.append({"role": role, "content": content})
+            else:
+                ollama_messages.append({"role": role, "content": str(content)})
+
+        # Global compression: if total ollama_messages tokens > threshold, compress.
+        # Threshold chosen to leave headroom for model response + KV cache overhead.
+        _OLLAMA_TOKEN_LIMIT = 16000  # ~16K tokens safe for 24K context window
+        _total_ollama_tokens = sum(len(str(m.get("content", ""))) for m in ollama_messages) // 4
+        if _total_ollama_tokens > _OLLAMA_TOKEN_LIMIT:
+            # Keep system + last 4 messages; summarise the rest
+            _sys_msgs = [m for m in ollama_messages if m.get("role") == "system"]
+            _non_sys  = [m for m in ollama_messages if m.get("role") != "system"]
+            _keep = _non_sys[-4:] if len(_non_sys) > 4 else _non_sys
+            _dropped = _non_sys[:-4] if len(_non_sys) > 4 else []
+            if _dropped:
+                _summary = " | ".join(
+                    f"[{m['role']}]: {str(m.get('content',''))[:100]}…" for m in _dropped[:6]
+                )
+                _trunc_msg = {"role": "user",
+                              "content": f"[Earlier context compressed: {_summary}]"}
+                ollama_messages = _sys_msgs + [_trunc_msg] + _keep
+            else:
+                ollama_messages = _sys_msgs + _keep
+            _new_tokens = sum(len(str(m.get("content",""))) for m in ollama_messages) // 4
+            logger.info("ollama compress: %d→%d msgs, ~%d→%d tokens",
+                        len(_non_sys) + len(_sys_msgs), len(ollama_messages),
+                        _total_ollama_tokens, _new_tokens)
+
+        # think=False disables CoT overhead for qwen3/qwen3.5 models (3-24x speed gain)
+        api_body: dict = {"model": ollama_model, "messages": ollama_messages, "stream": False, "think": False}
+        if ollama_tools:
+            api_body["tools"] = ollama_tools
+
+        # Log actual token estimate before sending
+        _final_tokens = sum(len(str(m.get("content",""))) for m in ollama_messages) // 4
+        logger.info("ollama request: model=%s msgs=%d est_tokens=%d",
+                    ollama_model, len(ollama_messages), _final_tokens)
+
+        # Use streaming to avoid non-stream timeout; collect all chunks then emit SSE.
+        api_body["stream"] = True
+        api_req = _ur_t.Request("http://localhost:11434/api/chat",
+                                data=_j_t.dumps(api_body).encode(),
+                                headers={"Content-Type": "application/json"})
+
+        def _stream_collect():
+            tool_calls, texts = [], []
+            with _ur_t.urlopen(api_req, timeout=120) as _r:
+                for _line in _r:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _d = _j_t.loads(_line)
+                    except Exception:
+                        continue
+                    _msg = _d.get("message", {})
+                    _tcs = _msg.get("tool_calls")
+                    if _tcs:
+                        tool_calls.extend(_tcs)
+                    _content = _msg.get("content", "")
+                    if _content:
+                        texts.append(_content)
+                    if _d.get("done"):
+                        break
+            return tool_calls, "".join(texts)
+
+        mid = f"msg_{_uid_t.uuid4().hex[:24]}"
+
+        # 4. Emit message_start BEFORE calling Ollama so the pool probe gets first chunk
+        #    within its 30s timeout window. Ollama can take 40+ seconds to respond.
+        yield "event: message_start\ndata: " + _j_t.dumps({
+            "type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant",
+                "content": [], "model": request.model, "stop_reason": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            }
+        }) + "\n\n"
+
+        # Now call Ollama (after yielding message_start so pool probe succeeds)
         try:
-            async for chunk in provider.stream_response(ollama_request, input_tokens, request_id=request_id):
-                yield chunk
-        finally:
-            await provider.cleanup()
+            tool_calls_out, text_out = await asyncio.get_event_loop().run_in_executor(
+                None, _stream_collect
+            )
+        except Exception as _re:
+            logger.warning("claude_subprocess: Ollama /api/chat failed: %s", _re)
+            tool_calls_out, text_out = [], ""
+
+        block_idx = 0
+
+        # 5. Emit tool_use blocks if model made tool calls.
+        #    Preserve Ollama's original tool call ID so round-trip back to Ollama is consistent.
+        for tc in tool_calls_out:
+            fn = tc.get("function", {})
+            tool_name = fn.get("name", "")
+            tool_args = fn.get("arguments", {})
+            # Use Ollama's own id (call_xxx) — if absent fall back to generated toolu_xxx
+            tool_id = tc.get("id") or f"toolu_{_uid_t.uuid4().hex[:24]}"
+            args_json = _j_t.dumps(tool_args) if isinstance(tool_args, dict) else str(tool_args)
+            yield "event: content_block_start\ndata: " + _j_t.dumps({
+                "type": "content_block_start", "index": block_idx,
+                "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
+            }) + "\n\n"
+            yield "event: content_block_delta\ndata: " + _j_t.dumps({
+                "type": "content_block_delta", "index": block_idx,
+                "delta": {"type": "input_json_delta", "partial_json": args_json},
+            }) + "\n\n"
+            yield "event: content_block_stop\ndata: " + _j_t.dumps({
+                "type": "content_block_stop", "index": block_idx,
+            }) + "\n\n"
+            block_idx += 1
+
+        # 6. Emit text block if model returned text
+        if text_out:
+            yield "event: content_block_start\ndata: " + _j_t.dumps({
+                "type": "content_block_start", "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            }) + "\n\n"
+            yield "event: content_block_delta\ndata: " + _j_t.dumps({
+                "type": "content_block_delta", "index": block_idx,
+                "delta": {"type": "text_delta", "text": text_out},
+            }) + "\n\n"
+            yield "event: content_block_stop\ndata: " + _j_t.dumps({
+                "type": "content_block_stop", "index": block_idx,
+            }) + "\n\n"
+            block_idx += 1
+
+        stop_reason = "tool_use" if tool_calls_out else "end_turn"
+        yield "event: message_delta\ndata: " + _j_t.dumps({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": 0},
+        }) + "\n\n"
+        yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
 def _extract_system_text(system: Any) -> str:
