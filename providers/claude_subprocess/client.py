@@ -30,11 +30,26 @@ _CLAUDE_MODEL_MAP: dict[str, str] = {
     "opus": "claude-opus-4-8",
 }
 
-_OLLAMA_MODEL_MAP: dict[str, str] = {
-    "haiku": "qwen3.5:9b",
-    "sonnet": "qwen3.5:9b",
-    "opus": "qwen3.5:9b",
-}
+_OLLAMA_MODEL_DEFAULT = "qwen3.5:9b"
+_ollama_model_cache: tuple[float, str] | None = None  # (expires_at, model)
+_OLLAMA_MODEL_CACHE_TTL = 30.0  # seconds
+
+
+def _fetch_ollama_model() -> str:
+    """Read current Ollama text model from search_api /fcc-status (30s cache)."""
+    global _ollama_model_cache
+    import time as _time_m
+    now = _time_m.monotonic()
+    if _ollama_model_cache and now < _ollama_model_cache[0]:
+        return _ollama_model_cache[1]
+    try:
+        import urllib.request as _ur_m, json as _j_m
+        with _ur_m.urlopen("http://localhost:8765/fcc-status", timeout=2) as r:
+            model = _j_m.loads(r.read()).get("ollama_model") or _OLLAMA_MODEL_DEFAULT
+    except Exception:
+        model = (_ollama_model_cache[1] if _ollama_model_cache else _OLLAMA_MODEL_DEFAULT)
+    _ollama_model_cache = (now + _OLLAMA_MODEL_CACHE_TTL, model)
+    return model
 
 # Matches <tool_call>...</tool_call> and malformed variants like /tool_call>{...}
 _TOOL_CALL_RE = re.compile(
@@ -124,7 +139,7 @@ class ClaudeSubprocessProvider(BaseProvider):
             "--no-session-persistence",
             "--output-format", "json",
             "--max-turns", "5",
-            "--allowed-tools", "WebSearch,WebFetch,Read",
+            "--allowed-tools", "Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Bash,Agent,mcp__hermes-kb__*",
         ]
         if final_system:
             cmd += ["--system-prompt", final_system]
@@ -272,26 +287,30 @@ class ClaudeSubprocessProvider(BaseProvider):
         raw_system = _extract_system_text(request.system)
         _is_claude_code_prompt = any(m in raw_system for m in _CLAUDE_CODE_MARKERS)
         if _is_claude_code_prompt:
-            # Compress: keep tool/capability descriptions from middle of prompt,
-            # but OVERRIDE the identity section with Jarvis to prevent role confusion.
-            # Identity override MUST come first so the model reads it before the tools.
-            _identity = (
-                "You are Jarvis, a concise personal AI assistant. "
-                "Be direct and complete tasks immediately. "
-                "Respond in the same language as the user.\n\n"
-            )
-            if len(raw_system) > _SYS_KEEP_CHARS:
-                # Keep tool descriptions from the middle of the prompt (skip first 2K identity chars)
-                _tool_section = raw_system[2000:_SYS_KEEP_CHARS + 2000].strip()
-                _effective_system = _identity + _tool_section
+            # Use ONLY the SOUL.md head — do NOT include Claude Code tool descriptions.
+            # Direct test confirms: short clean prompt → qwen3.5 generates JSON tool_calls.
+            # Adding Claude Code tool section (XML format examples) causes qwen3.5 to output
+            # XML in text content instead of JSON tool_calls, breaking tool execution.
+            _soul_marker = "# Jarvis"
+            _soul_start = raw_system.find(_soul_marker)
+            if _soul_start >= 0:
+                _effective_system = raw_system[_soul_start:_soul_start + 600].strip()
             else:
-                _effective_system = _identity + raw_system
+                _effective_system = (
+                    "You are Jarvis. You HAVE tools: Bash, Read, Write, WebSearch, WebFetch. "
+                    "Execute tasks directly. Call Bash when asked to run a command."
+                )
             logger.info(
-                "claude_subprocess: compressed system prompt %d→%d chars",
+                "claude_subprocess: using SOUL.md head %d→%d chars",
                 len(raw_system), len(_effective_system),
             )
         else:
-            _effective_system = raw_system or "You are Jarvis, a concise personal AI assistant. Be direct."
+            # Also cap SOUL.md-only system prompts (Round 2+ when claude -p omits built-in prompt)
+            _soul_start2 = raw_system.find("# Jarvis") if raw_system else -1
+            if _soul_start2 >= 0:
+                _effective_system = raw_system[_soul_start2:_soul_start2 + 600].strip()
+            else:
+                _effective_system = raw_system or "You are Jarvis. Be direct."
 
         # 0.1 Compress conversation history if too large for local model context.
         #     - Keep recent KEEP_TURNS messages in full (recent tool results matter most)
@@ -383,19 +402,24 @@ class ClaudeSubprocessProvider(BaseProvider):
             )
 
         # 1. Convert tools: Anthropic → OpenAI function calling format (qwen3.5 native)
+        #    Only pass core tools — reduces schema size and keeps model focused.
+        _CORE_TOOLS = {"Bash", "Read", "Write", "WebSearch", "WebFetch"}
         ollama_tools = None
         if request.tools:
             ollama_tools = []
             for t in request.tools:
                 name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else "")
+                if name not in _CORE_TOOLS:
+                    continue
                 desc = getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")
                 schema = (getattr(t, "input_schema", None) or
                           (t.get("input_schema") if isinstance(t, dict) else None) or {})
-                if name:
-                    ollama_tools.append({
-                        "type": "function",
-                        "function": {"name": name, "description": desc, "parameters": schema},
-                    })
+                ollama_tools.append({
+                    "type": "function",
+                    "function": {"name": name, "description": desc, "parameters": schema},
+                })
+            if not ollama_tools:
+                ollama_tools = None
 
         # 2. Build /api/chat messages with native vision + tool support.
         #    Anthropic format → Ollama /api/chat format:
@@ -409,7 +433,11 @@ class ClaudeSubprocessProvider(BaseProvider):
                 btype = (getattr(block, "type", None) or
                          (block.get("type") if isinstance(block, dict) else None))
                 if btype == "text":
-                    texts.append(getattr(block, "text", "") or block.get("text", ""))
+                    _t = getattr(block, "text", "") or block.get("text", "")
+                    if role == "user":
+                        _t = _strip_reminders(_t)
+                    if _t:
+                        texts.append(_t)
                 elif btype in ("image", "image_url"):
                     # Extract base64 data
                     if btype == "image":
@@ -460,6 +488,33 @@ class ClaudeSubprocessProvider(BaseProvider):
                 out.append(entry)
             return out
 
+        import re as _re_sr
+        _SYSTEM_REMINDER_RE = _re_sr.compile(
+            r"<system-reminder>.*?</system-reminder>", _re_sr.DOTALL
+        )
+        # Hindsight injects conversation summaries like "对话摘要：\n用户：...\nJarvis：FAKE_RESULT"
+        # These contain hallucinated results from previous sessions and create feedback loops.
+        _CONV_SUMMARY_RE = _re_sr.compile(
+            r"对话摘要[：:].+?(?=\n\n|\Z)", _re_sr.DOTALL
+        )
+        # Claude Code adds "LANGUAGE INSTRUCTION: ..." prefix to user messages.
+        _LANG_INSTR_RE = _re_sr.compile(
+            r"^LANGUAGE INSTRUCTION:[^\n]*\n*", _re_sr.MULTILINE
+        )
+        # Hindsight injects evaluation blocks like "判断：\n1. 用户是否明确..."
+        # These cause qwen3.5 to write to USER.md instead of executing the task.
+        _JUDGE_BLOCK_RE = _re_sr.compile(
+            r"判断[：:]\s*\n.*?(?=\n\n|\Z)", _re_sr.DOTALL
+        )
+
+        def _strip_reminders(text: str) -> str:
+            """Remove injected hook content from user messages before sending to Ollama."""
+            result = _SYSTEM_REMINDER_RE.sub("", text)
+            result = _CONV_SUMMARY_RE.sub("", result)
+            result = _LANG_INSTR_RE.sub("", result)
+            result = _JUDGE_BLOCK_RE.sub("", result)
+            return result.strip()
+
         ollama_messages = []
         if _effective_system:
             ollama_messages.append({"role": "system", "content": _effective_system})
@@ -469,9 +524,13 @@ class ClaudeSubprocessProvider(BaseProvider):
             if isinstance(content, list):
                 ollama_messages.extend(_convert_block_list(role, content))
             elif isinstance(content, str):
-                ollama_messages.append({"role": role, "content": content})
+                cleaned = _strip_reminders(content) if role == "user" else content
+                if cleaned:
+                    ollama_messages.append({"role": role, "content": cleaned})
             else:
-                ollama_messages.append({"role": role, "content": str(content)})
+                cleaned = _strip_reminders(str(content)) if role == "user" else str(content)
+                if cleaned:
+                    ollama_messages.append({"role": role, "content": cleaned})
 
         # Global compression: if total ollama_messages tokens > threshold, compress.
         # Threshold chosen to leave headroom for model response + KV cache overhead.
@@ -497,6 +556,13 @@ class ClaudeSubprocessProvider(BaseProvider):
                         len(_non_sys) + len(_sys_msgs), len(ollama_messages),
                         _total_ollama_tokens, _new_tokens)
 
+        # Track last tool result for post-processing (see below after _stream_collect)
+        _last_tool_result = None
+        for _m in reversed(ollama_messages):
+            if _m.get("role") == "tool":
+                _last_tool_result = str(_m.get("content", ""))
+                break
+
         # think=False disables CoT overhead for qwen3/qwen3.5 models (3-24x speed gain)
         api_body: dict = {"model": ollama_model, "messages": ollama_messages, "stream": False, "think": False}
         if ollama_tools:
@@ -504,8 +570,19 @@ class ClaudeSubprocessProvider(BaseProvider):
 
         # Log actual token estimate before sending
         _final_tokens = sum(len(str(m.get("content",""))) for m in ollama_messages) // 4
-        logger.info("ollama request: model=%s msgs=%d est_tokens=%d",
-                    ollama_model, len(ollama_messages), _final_tokens)
+        logger.info("ollama request: model=%s msgs=%d est_tokens=%d tools=%s",
+                    ollama_model, len(ollama_messages), _final_tokens,
+                    [t["function"]["name"] for t in (ollama_tools or [])])
+        # DEBUG: dump all messages
+        import sys as _sys
+        for _dbg_m in ollama_messages:
+            _r = _dbg_m.get("role", "?")
+            _tcs = _dbg_m.get("tool_calls")
+            if _tcs:
+                _sys.stderr.write(f"[DBG {_r}]: tool_calls={_tcs}\n")
+            else:
+                _c = str(_dbg_m.get("content") or "")
+                _sys.stderr.write(f"[DBG {_r}]: {_c[:300]}\n")
 
         # Use streaming to avoid non-stream timeout; collect all chunks then emit SSE.
         api_body["stream"] = True
@@ -555,6 +632,33 @@ class ClaudeSubprocessProvider(BaseProvider):
         except Exception as _re:
             logger.warning("claude_subprocess: Ollama /api/chat failed: %s", _re)
             tool_calls_out, text_out = [], ""
+
+        # 5a'. If we have a tool_result in context and qwen3.5 returned only text
+        #      (no new tool_calls), replace the text with the actual tool result.
+        #      This prevents qwen3.5 from wrapping real results in meta-commentary.
+        if _last_tool_result and not tool_calls_out and text_out:
+            text_out = _last_tool_result
+            logger.info("claude_subprocess: replaced qwen3.5 commentary with tool_result")
+
+        # 5a. Check for XML tool calls embedded in text.
+        #     qwen3.5 uses Claude Code tool descriptions which teach XML <tool_call> format.
+        #     If no JSON tool_calls found but text contains XML tags, extract them here.
+        if text_out and not tool_calls_out:
+            _parsed = _parse_content(text_out)
+            _xml_tools = [p for p in _parsed if p.get("type") == "tool_use"]
+            if _xml_tools:
+                for _p in _xml_tools:
+                    tool_calls_out.append({
+                        "id": f"toolu_{_uid_t.uuid4().hex[:24]}",
+                        "function": {
+                            "name": _p.get("name", ""),
+                            "arguments": _p.get("input", {}),
+                        }
+                    })
+                text_out = " ".join(
+                    _p.get("text", "") for _p in _parsed if _p.get("type") == "text"
+                ).strip()
+                logger.info("claude_subprocess: extracted %d XML tool calls from text", len(_xml_tools))
 
         block_idx = 0
 
@@ -758,11 +862,7 @@ def _resolve_claude_model(model_name: str) -> str:
 
 
 def _resolve_ollama_model(model_name: str) -> str:
-    name_lower = model_name.lower()
-    for key, ollama_model in _OLLAMA_MODEL_MAP.items():
-        if key in name_lower:
-            return ollama_model
-    return "qwen2.5:0.5b"
+    return _fetch_ollama_model()
 
 
 def _clean_env() -> dict[str, str]:
