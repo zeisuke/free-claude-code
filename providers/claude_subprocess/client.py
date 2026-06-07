@@ -5,7 +5,7 @@ Claude Code subscription auth. The agent loop (tool calls, WebSearch, Read, Bash
 runs inside the subprocess; FCC waits for the final 'result' event and returns
 it as a single Anthropic SSE text block.
 
-Falls back to Ollama on any subprocess failure.
+Falls back to Ollama only when FCC is active (all models in cooldown) or credit limit exceeded.
 """
 
 from __future__ import annotations
@@ -95,20 +95,14 @@ class ClaudeSubprocessProvider(BaseProvider):
         request_id: str | None = None,
         thinking_enabled: bool | None = None,
     ) -> AsyncIterator[str]:
-        if await _is_fcc_active():
+        _fcc_now = await _is_fcc_active()
+        if _fcc_now:
             logger.info("claude_subprocess: FCC active — routing to Ollama")
             async for chunk in self._ollama_stream(request, input_tokens, request_id=request_id):
                 yield chunk
             return
-        try:
-            async for chunk in self._subprocess_stream(request, input_tokens):
-                yield chunk
-        except Exception as exc:
-            logger.warning(
-                f"claude_subprocess failed ({type(exc).__name__}: {str(exc)[:120]}), falling back to Ollama"
-            )
-            async for chunk in self._ollama_stream(request, input_tokens, request_id=request_id):
-                yield chunk
+        async for chunk in self._subprocess_stream(request, input_tokens):
+            yield chunk
 
     async def _subprocess_stream(self, request: Any, input_tokens: int) -> AsyncIterator[str]:
         system_text = _extract_system_text(request.system)
@@ -138,7 +132,7 @@ class ClaudeSubprocessProvider(BaseProvider):
             "--dangerously-skip-permissions",
             "--no-session-persistence",
             "--output-format", "json",
-            "--max-turns", "5",
+            "--max-turns", "15",
             "--allowed-tools", "Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Bash,Agent,mcp__hermes-kb__*",
         ]
         if final_system:
@@ -149,12 +143,18 @@ class ClaudeSubprocessProvider(BaseProvider):
             if img_dir and img_dir not in seen_dirs:
                 cmd += ["--add-dir", img_dir]
                 seen_dirs.add(img_dir)
-        cmd.append(prompt)
+        logger.debug(
+            f"subprocess: model={claude_model!r} prompt_len={len(prompt)} "
+            f"prompt_start={prompt[:120]!r}"
+        )
+        # Prompt is sent via stdin; claude -p ignores the CLI argument when stdin is
+        # /dev/null (v2.1.163 bug: checks stdin first, errors if empty regardless of arg).
+        prompt_bytes = prompt.encode()
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=_clean_env(),
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=PIPE,
             stderr=PIPE,
             cwd=_fcc_cwd,
@@ -177,7 +177,7 @@ class ClaudeSubprocessProvider(BaseProvider):
 
         # claude -p --output-format json blocks until the full agent loop completes,
         # then writes a single JSON object. Yield keepalives every 5s while waiting.
-        communicate_task = asyncio.ensure_future(proc.communicate())
+        communicate_task = asyncio.ensure_future(proc.communicate(prompt_bytes))
         elapsed = 0
         while not communicate_task.done():
             done, _ = await asyncio.wait({communicate_task}, timeout=5.0)
@@ -189,16 +189,25 @@ class ClaudeSubprocessProvider(BaseProvider):
                     raise RuntimeError(f"claude subprocess timeout after {_SUBPROCESS_TIMEOUT}s")
 
         stdout_bytes, stderr_bytes = communicate_task.result()
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude exit {proc.returncode}: {stderr_bytes.decode()[:300]}")
 
+        # Try stdout first — claude exits 1 on some non-fatal conditions (e.g. error_max_turns)
+        # but still writes JSON to stdout. Only fall back to stderr error if stdout is unusable.
         try:
             result_obj = json.loads(stdout_bytes.decode())
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"claude json parse error: {exc}") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            result_obj = {}
 
         # Extract final text from result object
         result_text = result_obj.get("result", "")
+
+        if proc.returncode != 0 and not result_text:
+            subtype = result_obj.get("subtype", "")
+            if subtype == "error_max_turns":
+                # Return a graceful message rather than letting hermes-agent see empty content
+                result_text = "[任务超过最大步骤数，请简化请求后重试。]"
+            else:
+                raise RuntimeError(f"claude exit {proc.returncode}: {stderr_bytes.decode()[:300]}")
+
         if not result_text and result_obj.get("is_error"):
             raise RuntimeError(f"claude error result: {result_obj.get('subtype','unknown')}")
         if not result_text:
@@ -286,31 +295,44 @@ class ClaudeSubprocessProvider(BaseProvider):
         _SYS_KEEP_CHARS = 6000   # ~1.5K tokens: role + key tools, leaves room for messages + KV cache
         raw_system = _extract_system_text(request.system)
         _is_claude_code_prompt = any(m in raw_system for m in _CLAUDE_CODE_MARKERS)
+        # Defined here so both if/else branches can use it
+        _STDOUT_RULE = (
+            "\nBash commands MUST print results to stdout. "
+            "Never redirect output to files (no >, >>, tee). "
+            "Keep commands simple — do not add extra error handling or logging."
+        )
+
+        def _soul_head() -> str:
+            """Load first 600 chars of SOUL.md from disk (preferred) or fallback."""
+            import pathlib as _pl2
+            _sp = _pl2.Path.home() / ".hermes" / "SOUL.md"
+            if _sp.exists():
+                txt = _sp.read_text()
+                pos = txt.find("# Jarvis")
+                if pos >= 0:
+                    return txt[pos:pos + 600].strip()
+            return "You are Jarvis. You HAVE tools: Bash, Read, Write, WebSearch, WebFetch. Execute tasks directly. Call Bash when asked to run a command."
+
         if _is_claude_code_prompt:
             # Use ONLY the SOUL.md head — do NOT include Claude Code tool descriptions.
-            # Direct test confirms: short clean prompt → qwen3.5 generates JSON tool_calls.
-            # Adding Claude Code tool section (XML format examples) causes qwen3.5 to output
-            # XML in text content instead of JSON tool_calls, breaking tool execution.
-            _soul_marker = "# Jarvis"
-            _soul_start = raw_system.find(_soul_marker)
+            # The first fcc-claude call may not have SOUL.md appended yet; always load from disk.
+            _soul_start = raw_system.find("# Jarvis")
             if _soul_start >= 0:
-                _effective_system = raw_system[_soul_start:_soul_start + 600].strip()
+                _effective_system = raw_system[_soul_start:_soul_start + 600].strip() + _STDOUT_RULE
             else:
-                _effective_system = (
-                    "You are Jarvis. You HAVE tools: Bash, Read, Write, WebSearch, WebFetch. "
-                    "Execute tasks directly. Call Bash when asked to run a command."
-                )
+                # First call: SOUL.md not in raw_system yet — load from disk
+                _effective_system = _soul_head() + _STDOUT_RULE
             logger.info(
                 "claude_subprocess: using SOUL.md head %d→%d chars",
                 len(raw_system), len(_effective_system),
             )
         else:
-            # Also cap SOUL.md-only system prompts (Round 2+ when claude -p omits built-in prompt)
+            # Non claude-code prompt: extract from raw_system or load from disk
             _soul_start2 = raw_system.find("# Jarvis") if raw_system else -1
             if _soul_start2 >= 0:
-                _effective_system = raw_system[_soul_start2:_soul_start2 + 600].strip()
+                _effective_system = raw_system[_soul_start2:_soul_start2 + 600].strip() + _STDOUT_RULE
             else:
-                _effective_system = raw_system or "You are Jarvis. Be direct."
+                _effective_system = _soul_head() + _STDOUT_RULE
 
         # 0.1 Compress conversation history if too large for local model context.
         #     - Keep recent KEEP_TURNS messages in full (recent tool results matter most)
@@ -402,8 +424,23 @@ class ClaudeSubprocessProvider(BaseProvider):
             )
 
         # 1. Convert tools: Anthropic → OpenAI function calling format (qwen3.5 native)
-        #    Only pass core tools — reduces schema size and keeps model focused.
+        #    Use minimal schemas — the Claude Code full schemas are 10K+ chars each,
+        #    consuming the entire context window and preventing qwen3.5 from thinking.
         _CORE_TOOLS = {"Bash", "Read", "Write", "WebSearch", "WebFetch"}
+        _MINIMAL_SCHEMAS = {
+            "Bash":      {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to run"}}, "required": ["command"]},
+            "Read":      {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
+            "Write":     {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"]},
+            "WebSearch": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            "WebFetch":  {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+        }
+        _MINIMAL_DESCS = {
+            "Bash":      "Execute shell commands. Output goes to stdout.",
+            "Read":      "Read file contents.",
+            "Write":     "Write content to a file.",
+            "WebSearch": "Search the web.",
+            "WebFetch":  "Fetch a URL.",
+        }
         ollama_tools = None
         if request.tools:
             ollama_tools = []
@@ -411,12 +448,13 @@ class ClaudeSubprocessProvider(BaseProvider):
                 name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else "")
                 if name not in _CORE_TOOLS:
                     continue
-                desc = getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")
-                schema = (getattr(t, "input_schema", None) or
-                          (t.get("input_schema") if isinstance(t, dict) else None) or {})
                 ollama_tools.append({
                     "type": "function",
-                    "function": {"name": name, "description": desc, "parameters": schema},
+                    "function": {
+                        "name": name,
+                        "description": _MINIMAL_DESCS.get(name, name),
+                        "parameters": _MINIMAL_SCHEMAS.get(name, {"type": "object", "properties": {}}),
+                    },
                 })
             if not ollama_tools:
                 ollama_tools = None
@@ -507,6 +545,26 @@ class ClaudeSubprocessProvider(BaseProvider):
             r"判断[：:]\s*\n.*?(?=\n\n|\Z)", _re_sr.DOTALL
         )
 
+        # Track multi-step bash commands so we can inject them sequentially
+        _pending_bash_steps: list[str] = []
+
+        def _split_bash_steps(text: str) -> tuple[str, list[str]]:
+            """If text is 'run bash: cmd1; cmd2', return ('run bash: cmd1', ['cmd2']).
+            Splits on ; and && so qwen3.5 executes one step at a time."""
+            import re as _re_bash
+            m = _re_bash.search(r'run bash:\s*(.+)', text, _re_bash.IGNORECASE)
+            if not m:
+                return text, []
+            full_cmd = m.group(1).strip()
+            # Split on ; or && preserving the rest
+            parts = _re_bash.split(r'\s*(?:;|&&)\s*', full_cmd)
+            parts = [p.strip() for p in parts if p.strip()]
+            if len(parts) <= 1:
+                return text, []
+            first_step = text[:m.start(1)] + parts[0]
+            remaining = parts[1:]
+            return first_step, remaining
+
         def _strip_reminders(text: str) -> str:
             """Remove injected hook content from user messages before sending to Ollama."""
             result = _SYSTEM_REMINDER_RE.sub("", text)
@@ -516,15 +574,30 @@ class ClaudeSubprocessProvider(BaseProvider):
             return result.strip()
 
         ollama_messages = []
+        _first_user_seen = False
         if _effective_system:
             ollama_messages.append({"role": "system", "content": _effective_system})
         for msg in _msgs:
             role = str(getattr(msg, "role", "user"))
             content = msg.content
             if isinstance(content, list):
-                ollama_messages.extend(_convert_block_list(role, content))
+                converted = _convert_block_list(role, content)
+                # Apply bash split to first NON-EMPTY user message from list branch.
+                # Only set _first_user_seen if we actually found non-empty content;
+                # empty converted messages (all blocks stripped) must NOT consume the flag.
+                if role == "user" and not _first_user_seen:
+                    for i, cm in enumerate(converted):
+                        if cm.get("role") == "user" and cm.get("content"):
+                            _first_user_seen = True
+                            cm["content"], steps = _split_bash_steps(cm["content"])
+                            _pending_bash_steps.extend(steps)
+                            break
+                ollama_messages.extend(converted)
             elif isinstance(content, str):
                 cleaned = _strip_reminders(content) if role == "user" else content
+                if role == "user" and not _first_user_seen and cleaned:
+                    _first_user_seen = True
+                    cleaned, _pending_bash_steps[:] = _split_bash_steps(cleaned)
                 if cleaned:
                     ollama_messages.append({"role": role, "content": cleaned})
             else:
@@ -563,29 +636,49 @@ class ClaudeSubprocessProvider(BaseProvider):
                 _last_tool_result = str(_m.get("content", ""))
                 break
 
+        # If the last tool result contains an error, inject a "continue" user message.
+        # qwen3.5 needs explicit guidance to proceed after tool failure (unlike Claude
+        # which infers this from context). Without this, qwen3.5 stops after the error.
+        _ERROR_MARKERS = ("no such file", "not found", "error", "failed", "exit code: 1",
+                          "permission denied", "command not found", "enoent", "exception")
+        if _last_tool_result and any(m in _last_tool_result.lower() for m in _ERROR_MARKERS):
+            if _pending_bash_steps:
+                next_cmd = _pending_bash_steps.pop(0)
+                ollama_messages.append({
+                    "role": "user",
+                    "content": f"The previous command failed. Now run: {next_cmd}"
+                })
+                logger.info("claude_subprocess: injected next step after failure: %s", next_cmd)
+            else:
+                ollama_messages.append({
+                    "role": "user",
+                    "content": "The previous command failed. Continue with the remaining steps of the task."
+                })
+                logger.info("claude_subprocess: injected continue message after tool failure")
+
         # think=False disables CoT overhead for qwen3/qwen3.5 models (3-24x speed gain)
-        api_body: dict = {"model": ollama_model, "messages": ollama_messages, "stream": False, "think": False}
+        # think=True required for reliable tool calling decisions.
+        # Without thinking, qwen3.5 uses pattern matching and skips tools for "known" commands.
+        # Speed penalty is acceptable: tool calling accuracy > inference speed.
+        api_body: dict = {
+            "model": ollama_model,
+            "messages": ollama_messages,
+            "stream": False,
+            "think": True,
+        }
         if ollama_tools:
             api_body["tools"] = ollama_tools
 
-        # Log actual token estimate before sending
         _final_tokens = sum(len(str(m.get("content",""))) for m in ollama_messages) // 4
+        _tool_names = [t["function"]["name"] for t in (ollama_tools or [])]
         logger.info("ollama request: model=%s msgs=%d est_tokens=%d tools=%s",
-                    ollama_model, len(ollama_messages), _final_tokens,
-                    [t["function"]["name"] for t in (ollama_tools or [])])
-        # DEBUG: dump all messages
-        import sys as _sys
-        for _dbg_m in ollama_messages:
-            _r = _dbg_m.get("role", "?")
-            _tcs = _dbg_m.get("tool_calls")
-            if _tcs:
-                _sys.stderr.write(f"[DBG {_r}]: tool_calls={_tcs}\n")
-            else:
-                _c = str(_dbg_m.get("content") or "")
-                _sys.stderr.write(f"[DBG {_r}]: {_c[:300]}\n")
+                    ollama_model, len(ollama_messages), _final_tokens, _tool_names)
 
-        # Use streaming to avoid non-stream timeout; collect all chunks then emit SSE.
-        api_body["stream"] = True
+        # Use stream=False: qwen3.5's XML <tool_call> format requires full response for
+        # Ollama's qwen3.5 parser to detect tool calls. stream=True splits XML across
+        # chunks causing tool calls to be missed. The pool probe is satisfied by the
+        # message_start event yielded above (before this Ollama call).
+        api_body["stream"] = False
         api_req = _ur_t.Request("http://localhost:11434/api/chat",
                                 data=_j_t.dumps(api_body).encode(),
                                 headers={"Content-Type": "application/json"})
@@ -593,23 +686,20 @@ class ClaudeSubprocessProvider(BaseProvider):
         def _stream_collect():
             tool_calls, texts = [], []
             with _ur_t.urlopen(api_req, timeout=120) as _r:
-                for _line in _r:
-                    _line = _line.strip()
-                    if not _line:
-                        continue
-                    try:
-                        _d = _j_t.loads(_line)
-                    except Exception:
-                        continue
-                    _msg = _d.get("message", {})
-                    _tcs = _msg.get("tool_calls")
-                    if _tcs:
-                        tool_calls.extend(_tcs)
-                    _content = _msg.get("content", "")
-                    if _content:
-                        texts.append(_content)
-                    if _d.get("done"):
-                        break
+                raw = _r.read()
+            # stream=False: single JSON response
+            try:
+                _d = _j_t.loads(raw)
+            except Exception as _pe:
+                logger.warning("claude_subprocess: Ollama JSON parse error: %s raw=%s", _pe, raw[:200])
+                return tool_calls, ""
+            _msg = _d.get("message", {})
+            _tcs = _msg.get("tool_calls")
+            if _tcs:
+                tool_calls.extend(_tcs)
+            _content = _msg.get("content", "")
+            if _content:
+                texts.append(_content)
             return tool_calls, "".join(texts)
 
         mid = f"msg_{_uid_t.uuid4().hex[:24]}"
@@ -633,12 +723,13 @@ class ClaudeSubprocessProvider(BaseProvider):
             logger.warning("claude_subprocess: Ollama /api/chat failed: %s", _re)
             tool_calls_out, text_out = [], ""
 
-        # 5a'. If we have a tool_result in context and qwen3.5 returned only text
-        #      (no new tool_calls), replace the text with the actual tool result.
-        #      This prevents qwen3.5 from wrapping real results in meta-commentary.
-        if _last_tool_result and not tool_calls_out and text_out:
+        # 5a'. If we have a tool_result in context and qwen3.5 returned no new tool_calls,
+        #      use the tool_result as the output. This handles two cases:
+        #      (a) qwen3.5 wraps result in commentary → replace with raw tool_result
+        #      (b) qwen3.5 returns empty text after tool execution → use tool_result directly
+        if _last_tool_result and not tool_calls_out:
             text_out = _last_tool_result
-            logger.info("claude_subprocess: replaced qwen3.5 commentary with tool_result")
+            logger.info("claude_subprocess: using tool_result as output (text_out was: %r)", text_out[:50] if text_out else "empty")
 
         # 5a. Check for XML tool calls embedded in text.
         #     qwen3.5 uses Claude Code tool descriptions which teach XML <tool_call> format.

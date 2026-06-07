@@ -171,6 +171,7 @@ def _build_models_list_response(
 # =============================================================================
 # Routes
 # =============================================================================
+@router.post("/anthropic/v1/messages")
 @router.post("/v1/messages")
 async def create_message(
     request_data: MessagesRequest,
@@ -193,9 +194,109 @@ async def create_message(
 
 
 @router.api_route("/v1/messages", methods=["HEAD", "OPTIONS"])
+@router.api_route("/anthropic/v1/messages", methods=["HEAD", "OPTIONS"])
 async def probe_messages(_auth=Depends(require_api_key)):
     """Respond to Claude compatibility probes for the messages endpoint."""
     return _probe_response("POST, HEAD, OPTIONS")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible /v1/chat/completions — converts to Anthropic and back.
+# All hermes-agent tool/memory calls use OpenAI format; this shim unifies them.
+# ---------------------------------------------------------------------------
+
+async def _openai_to_anthropic_request(body: dict) -> MessagesRequest:
+    """Convert OpenAI chat completions body to Anthropic MessagesRequest."""
+    import uuid as _uuid
+    msgs = []
+    system = None
+    for m in body.get("messages", []):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            system = content
+        else:
+            msgs.append({"role": role, "content": content})
+    return MessagesRequest(
+        model=body.get("model", "claude-haiku-4-5"),
+        messages=msgs,
+        system=system,
+        max_tokens=body.get("max_tokens") or 4096,
+        stream=body.get("stream"),
+        temperature=body.get("temperature"),
+        stop_sequences=body.get("stop") if isinstance(body.get("stop"), list) else
+                       ([body["stop"]] if body.get("stop") else None),
+    )
+
+
+async def _anthropic_sse_to_openai(anthropic_stream, model: str, request_id: str):
+    """Convert Anthropic SSE stream to OpenAI chat completion SSE format."""
+    import json as _json
+    yield f'data: {_json.dumps({"id": request_id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
+    async for chunk in anthropic_stream:
+        if not isinstance(chunk, (str, bytes)):
+            continue
+        text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[6:]
+            if raw.strip() == "[DONE]":
+                break
+            try:
+                event = _json.loads(raw)
+            except Exception:
+                continue
+            etype = event.get("type", "")
+            if etype == "content_block_delta":
+                delta_obj = event.get("delta", {})
+                if delta_obj.get("type") == "text_delta":
+                    yield f'data: {_json.dumps({"id": request_id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {"content": delta_obj.get("text", "")}, "finish_reason": None}]})}\n\n'
+            elif etype == "message_delta":
+                stop = event.get("delta", {}).get("stop_reason", "stop")
+                yield f'data: {_json.dumps({"id": request_id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": stop}]})}\n\n'
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/v1/chat/completions")
+async def create_chat_completion(
+    request: Request,
+    service: ClaudeProxyService = Depends(get_proxy_service),
+    _auth=Depends(require_api_key),
+):
+    """OpenAI-compatible chat completions — converts to Anthropic internally."""
+    import uuid as _uuid, json as _json
+    from fastapi.responses import StreamingResponse
+    body = await request.json()
+    anthropic_req = await _openai_to_anthropic_request(body)
+    model = body.get("model", "claude-haiku-4-5")
+    request_id = f"chatcmpl-{_uuid.uuid4().hex[:24]}"
+
+    if body.get("stream"):
+        anthropic_response = service.create_message(anthropic_req)
+        stream = getattr(anthropic_response, "body_iterator", None) or anthropic_response
+        return StreamingResponse(
+            _anthropic_sse_to_openai(stream, model, request_id),
+            media_type="text/event-stream",
+        )
+    else:
+        # Non-streaming: accumulate and convert
+        from api.services import _accumulate_sse_to_json
+        anthropic_req.stream = True
+        anthropic_response = service.create_message(anthropic_req)
+        stream = getattr(anthropic_response, "body_iterator", None) or anthropic_response
+        accumulated = await _accumulate_sse_to_json(stream)
+        body_dict = accumulated.body if hasattr(accumulated, "body") else b"{}"
+        msg_data = _json.loads(body_dict) if isinstance(body_dict, bytes) else {}
+        text = ""
+        for block in msg_data.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        from fastapi.responses import JSONResponse
+        return JSONResponse({
+            "id": request_id, "object": "chat.completion", "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        })
 
 
 @router.post("/v1/messages/count_tokens")
